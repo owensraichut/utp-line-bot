@@ -43,6 +43,15 @@ const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const BASE_URL = process.env.APP_BASE_URL || 'https://utenpatten-sgs.web.app';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'utenpatten2024';
 
+// ── In-Memory Debug Logs (ดูผ่าน /logs ได้) ─────────────────────
+const recentLogs = [];
+function logEvent(tag, data) {
+  const item = { time: new Date().toISOString(), tag, data };
+  recentLogs.push(item);
+  if (recentLogs.length > 50) recentLogs.shift();
+  console.log(`[${tag}]`, typeof data === 'object' ? JSON.stringify(data) : data);
+}
+
 // ── Helper: ส่ง LINE Push Message ──────────────────────────────
 async function sendLineFlexMessage(lineUserId, altText, flexContents) {
   if (!LINE_TOKEN) { console.error('No LINE token'); return; }
@@ -227,14 +236,24 @@ function buildMainMenuFlex(userId, linkedUser) {
 // ROUTE: POST /webhook (LINE Messaging API Webhook)
 // ════════════════════════════════════════════════════════════════
 app.post('/webhook', async (req, res) => {
+  logEvent('WEBHOOK_REQUEST', {
+    headers: {
+      'user-agent': req.headers['user-agent'],
+      'x-line-signature': req.headers['x-line-signature'] ? 'present' : 'none'
+    },
+    body: req.body
+  });
+
   // ตอบกลับ 200 OK ทันที เพื่อป้องกัน LINE timeout
   res.status(200).send('OK');
 
   const events = req.body.events || [];
   for (const event of events) {
     try {
+      logEvent('HANDLE_EVENT', { type: event.type, source: event.source, text: event.message && event.message.text });
       await handleLineEvent(event);
     } catch (err) {
+      logEvent('EVENT_ERROR', { error: err.message });
       console.error('Error handling event:', err);
     }
   }
@@ -695,6 +714,16 @@ app.get('/', (req, res) => {
     version: '2.0.0',
     school: 'โรงเรียนอุเทนพัฒนา',
     time: new Date().toISOString()
+  });
+});
+
+// ── Realtime Logs for Debugging ──────────────────────────────────
+app.get('/logs', (req, res) => {
+  res.json({
+    count: recentLogs.length,
+    firebaseConnected: !!db,
+    lineTokenSet: !!LINE_TOKEN,
+    logs: recentLogs
   });
 });
 
