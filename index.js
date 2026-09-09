@@ -1,24 +1,20 @@
 /**
- * LINE OA Notification & Interactive Bot Server
+ * LINE OA Notification & Interactive Bot Server v3.0
  * ระบบแจ้งเตือนและแชตบอท LINE OA สำหรับโรงเรียนอุเทนพัฒนา (UTP Smart @911zewge)
  * 
- * ความสามารถ:
- *  1. 🔔 แจ้งเตือนครูแบบ Flex Card เมื่อมีคำร้องใหม่ (POST /notify-teacher)
- *  2. 🔔 แจ้งเตือนนักเรียนเมื่อครูอนุมัติหรือสถานะเปลี่ยน (POST /notify-student)
- *  3. 🤖 Webhook 2 ทาง (POST /webhook):
- *     - แอดเพื่อน (Follow) ทักทายพร้อมปุ่มแนะนำ
- *     - พิมพ์ "ครู [ชื่อ]" หรือ "ผูกบัญชีครู [ชื่อ]" -> เชื่อมโยงบัญชีครูกับ LINE อัตโนมัติทันที
- *     - พิมพ์ "นักเรียน [รหัส 5 หลัก]" -> เชื่อมโยงบัญชีนักเรียนอัตโนมัติ
- *     - พิมพ์ "คำร้องค้าง" หรือ "งานค้าง" -> ครูเช็ครายการที่รอตรวจ พร้อมปุ่มกดอนุมัติ
- *     - พิมพ์ "เช็คเกรด" หรือ "สถานะ" -> นักเรียนเช็คสถานะคำร้องของตนเอง
- *     - พิมพ์ "id" -> ดู LINE User ID ของตนเอง
- *     - พิมพ์ "เมนู" หรือ "help" -> เมนูลัดสวยงาม
+ * ความสามารถใหม่:
+ *  1. 🔒 ยืนยันตัวตนครูด้วย PIN 4 หลัก ป้องกันการแอบอ้าง 100%
+ *  2. ⚡ Magic Link เข้าระบบเว็บอัตโนมัติ (1-Click Auto-Login) ไม่ต้องพิมพ์ PIN ซ้ำ
+ *  3. ⭐ อนุมัติเกรดใหม่ผ่านแชต LINE โดยตรง (In-Chat Approval via Postback)
+ *  4. 📝 มอบหมายงานนักเรียนผ่านแชต LINE
+ *  5. 📊 นักเรียนเช็คสถานะ / ครูตรวจงานค้าง
  */
 
 require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -43,13 +39,25 @@ const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const BASE_URL = process.env.APP_BASE_URL || 'https://utenpatten-sgs.web.app';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'utenpatten2024';
 
-// ── In-Memory Debug Logs (ดูผ่าน /logs ได้) ─────────────────────
+// ── In-Memory Sessions & Debug Logs ─────────────────────────────
 const recentLogs = [];
 function logEvent(tag, data) {
   const item = { time: new Date().toISOString(), tag, data };
   recentLogs.push(item);
   if (recentLogs.length > 50) recentLogs.shift();
   console.log(`[${tag}]`, typeof data === 'object' ? JSON.stringify(data) : data);
+}
+
+// Session maps for interactive multi-step flows in LINE
+const pendingPinVerification = new Map(); // userId -> { teacher, timestamp }
+const pendingWorkAssignment = new Map();  // userId -> { reqId, reqData, timestamp }
+
+// ── Helper: สร้าง Magic Link (One-Tap Auto Login) ───────────────
+function generateMagicLink(teacherId, requestId = '') {
+  const timestamp = Date.now();
+  const raw = `${WEBHOOK_SECRET}:${teacherId}:${timestamp}:${requestId}`;
+  const sig = crypto.createHash('sha256').update(raw).digest('hex');
+  return `${BASE_URL}/?page=teacher-verify&tid=${encodeURIComponent(teacherId)}&t=${timestamp}&sig=${sig}&req=${encodeURIComponent(requestId)}`;
 }
 
 // ── Helper: ส่ง LINE Push Message ──────────────────────────────
@@ -84,13 +92,61 @@ async function sendLineReply(replyToken, messages) {
   }
 }
 
-// ── Flex Card: แจ้งครูเมื่อมีคำร้องใหม่ ──────────────────────────
-function buildTeacherFlex(req, verifyUrl) {
+// ── Flex Card: แจ้งเตือนครู + ปุ่มอนุมัติในแชต + Magic Link ──────
+function buildTeacherFlex(req, magicUrl) {
   const gradeEmoji = req.gradeType === '0' ? '🔴' : req.gradeType === 'ร' ? '🟡' : '🟠';
   const gradeLabel = req.gradeType === '0' ? 'ผลการเรียน 0' : req.gradeType === 'ร' ? 'ร (รอส่งงาน)' : 'มส (ขาดสอบ/เวลาไม่พอ)';
   const submittedAt = req.studentSubmittedAt
     ? new Date(req.studentSubmittedAt).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })
     : '-';
+
+  // ปุ่มแอ็กชันในแชต (In-Chat Postback & Magic Link)
+  const actionButtons = [];
+
+  if (req.gradeType === '0' || req.gradeType === 'มส') {
+    // แก้ 0 หรือ มส ได้สูงสุดเกรด 1
+    actionButtons.push({
+      type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
+      action: {
+        type: 'postback',
+        label: '⭐ อนุมัติเกรด 1 ทันที',
+        data: `action=approve&reqId=${req.id}&grade=1`,
+        displayText: `อนุมัติเกรด 1 วิชา ${req.subjectCode}`
+      }
+    });
+  } else {
+    // ผลการเรียน "ร" สามารถเลือกเกรดได้
+    actionButtons.push({
+      type: 'box', layout: 'horizontal', spacing: 'sm',
+      contents: [
+        { type: 'button', style: 'primary', color: '#0B6623', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 1', data: `action=approve&reqId=${req.id}&grade=1`, displayText: 'อนุมัติเกรด 1' } },
+        { type: 'button', style: 'primary', color: '#1B5E20', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 2', data: `action=approve&reqId=${req.id}&grade=2`, displayText: 'อนุมัติเกรด 2' } },
+        { type: 'button', style: 'primary', color: '#2E7D32', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 3', data: `action=approve&reqId=${req.id}&grade=3`, displayText: 'อนุมัติเกรด 3' } },
+        { type: 'button', style: 'primary', color: '#388E3C', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 4', data: `action=approve&reqId=${req.id}&grade=4`, displayText: 'อนุมัติเกรด 4' } },
+      ]
+    });
+  }
+
+  // ปุ่มสั่งงานในแชต
+  actionButtons.push({
+    type: 'button', style: 'secondary', height: 'sm',
+    action: {
+      type: 'postback',
+      label: '📝 สั่งงานนักเรียน',
+      data: `action=assign_prompt&reqId=${req.id}`,
+      displayText: 'สั่งงานนักเรียน'
+    }
+  });
+
+  // ปุ่ม Magic Link เข้าระบบเว็บอัตโนมัติ
+  actionButtons.push({
+    type: 'button', style: 'link', height: 'sm',
+    action: {
+      type: 'uri',
+      label: '🌐 เปิดตรวจบนเว็บ (Auto-Login)',
+      uri: magicUrl
+    }
+  });
 
   return {
     type: 'bubble', size: 'mega',
@@ -126,12 +182,7 @@ function buildTeacherFlex(req, verifyUrl) {
     },
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
-      contents: [
-        { type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
-          action: { type: 'uri', label: '✅ เปิดตรวจสอบคำร้อง', uri: verifyUrl } },
-        { type: 'button', style: 'secondary', height: 'sm',
-          action: { type: 'uri', label: '🏠 เข้าสู่ระบบหลัก', uri: BASE_URL } },
-      ],
+      contents: actionButtons,
     },
   };
 }
@@ -158,6 +209,7 @@ function buildStudentFlex(req) {
         { type: 'text', text: 'วิชา: ' + req.subjectCode + ' ' + (req.subjectName || ''), size: 'sm', wrap: true },
         { type: 'text', text: 'สถานะ: ' + s.label, size: 'sm', weight: 'bold', color: s.color, wrap: true },
         ...(req.newGrade ? [{ type: 'text', text: 'เกรดใหม่: ' + req.newGrade, size: 'sm', weight: 'bold', color: '#0B6623' }] : []),
+        ...(req.assignmentDetails ? [{ type: 'text', text: 'งานที่ได้รับมอบหมาย: ' + req.assignmentDetails, size: 'xs', color: '#7B1FA2', wrap: true }] : []),
         ...(req.adminNote ? [{ type: 'text', text: 'หมายเหตุ: ' + req.adminNote, size: 'xs', color: '#666666', wrap: true }] : []),
       ],
     },
@@ -217,7 +269,11 @@ function buildMainMenuFlex(userId, linkedUser) {
             },
             {
               type: 'button', style: 'link', height: 'sm',
-              action: { type: 'uri', label: '🌐 เปิดเว็บไซต์หลัก', uri: BASE_URL }
+              action: {
+                type: 'uri',
+                label: '🌐 เปิดห้องทำงานครู (Auto-Login)',
+                uri: linkedUser && linkedUser.role === 'teacher' ? generateMagicLink(linkedUser.id) : BASE_URL
+              }
             }
           ]
         }
@@ -283,8 +339,8 @@ async function handleLineEvent(event) {
           {
             type: 'box', layout: 'vertical', backgroundColor: '#F5F5F5', paddingAll: '12px', cornerRadius: 'md', spacing: 'xs',
             contents: [
-              { type: 'text', text: '🟢 สำหรับคุณครู:', weight: 'bold', size: 'sm', color: '#0B6623' },
-              { type: 'text', text: 'พิมพ์ "ครู [ชื่อ]" เช่น: ครู ศิรชัช เพื่อรับแจ้งเตือนเมื่อมีนักเรียนยื่นคำร้อง', size: 'xs', wrap: true },
+              { type: 'text', text: '🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN 4 หลัก):', weight: 'bold', size: 'sm', color: '#0B6623' },
+              { type: 'text', text: 'พิมพ์ "ครู [ชื่อ] [PIN]" เช่น: ครู ศิรชัช 2108 เพื่อรับแจ้งเตือนและอนุมัติเกรดในแชต', size: 'xs', wrap: true },
               { type: 'separator', margin: 'sm' },
               { type: 'text', text: '🔵 สำหรับนักเรียน:', weight: 'bold', size: 'sm', color: '#1976D2' },
               { type: 'text', text: 'พิมพ์ "นักเรียน [รหัส 5 หลัก]" เช่น: นักเรียน 12345 เพื่อติดตามสถานะ', size: 'xs', wrap: true },
@@ -304,10 +360,313 @@ async function handleLineEvent(event) {
     return;
   }
 
-  // ── 2. Event: ผู้ใช้ส่งข้อความ (Message) ──
+  // ── 2. Event: Postback Action (กดปุ่มอนุมัติเกรด หรือสั่งงานในแชต) ──
+  if (event.type === 'postback') {
+    const postbackData = event.postback.data || '';
+    const params = new URLSearchParams(postbackData);
+    const action = params.get('action');
+
+    logEvent('POSTBACK_ACTION', { action, data: postbackData });
+
+    // A: ครูอนุมัติเกรดผ่านแชต
+    if (action === 'approve') {
+      const reqId = params.get('reqId');
+      const grade = params.get('grade');
+
+      if (!db) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: 'ระบบฐานข้อมูลขัดข้อง กรุณาลองใหม่ภายหลัง' }]);
+        return;
+      }
+
+      try {
+        const reqDoc = await db.collection('requests').doc(reqId).get();
+        if (!reqDoc.exists) {
+          await sendLineReply(event.replyToken, [{ type: 'text', text: '❌ ไม่พบข้อมูลคำร้องนี้ หรือคำร้องอาจถูกลบไปแล้ว' }]);
+          return;
+        }
+
+        const reqData = reqDoc.data();
+
+        // ตรวจสอบสิทธิ์: ผู้กดต้องเป็นครูประจำวิชานี้
+        const teacherDoc = await db.collection('teachers').doc(reqData.teacherId).get();
+        if (!teacherDoc.exists || teacherDoc.data().lineUserId !== userId) {
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: '⚠️ ขออภัยครับ ท่านไม่มีสิทธิ์อนุมัติคำร้องนี้ (คำร้องนี้เป็นของ ' + (reqData.teacherName || 'ครูท่านอื่น') + ')'
+          }]);
+          return;
+        }
+
+        // ตรวจสอบเพดานเกรด (0 และ มส ได้สูงสุดเกรด 1)
+        if ((reqData.gradeType === '0' || reqData.gradeType === 'มส') && grade !== '1' && grade !== 'ผ่าน') {
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: '⚠️ ตามระเบียบ สพฐ. การแก้ไข 0 หรือ มส ได้เกรดสูงสุดไม่เกินเกรด 1 ครับ'
+          }]);
+          return;
+        }
+
+        const teacherName = teacherDoc.data().name || teacherDoc.data().teacherName || 'คุณครู';
+        const updatedLogs = [
+          ...(reqData.auditLogs || []),
+          {
+            action: 'teacher_approved',
+            actorName: teacherName,
+            actorRole: 'teacher',
+            details: `อนุมัติผลการเรียนใหม่เป็นเกรด "${grade}" ผ่าน LINE OA (In-Chat Approval)`,
+            timestamp: new Date().toISOString()
+          }
+        ];
+
+        // บันทึกลง Firestore
+        await db.collection('requests').doc(reqId).update({
+          status: 'teacher_approved',
+          newGrade: grade,
+          teacherApprovedAt: new Date().toISOString(),
+          approvedVia: 'LINE_OA',
+          auditLogs: updatedLogs
+        });
+
+        // ส่งแจ้งเตือนนักเรียน (ถ้ามี lineUserId)
+        try {
+          const studentDoc = await db.collection('students').doc(reqData.studentId).get();
+          if (studentDoc.exists && studentDoc.data().lineUserId) {
+            const studentFlex = buildStudentFlex({
+              ...reqData,
+              status: 'teacher_approved',
+              newGrade: grade
+            });
+            await sendLineFlexMessage(
+              studentDoc.data().lineUserId,
+              `📢 ครูอนุมัติเกรดใหม่วิชา ${reqData.subjectCode} แล้ว!`,
+              studentFlex
+            );
+          }
+        } catch (sErr) {
+          console.warn('Notify student err:', sErr.message);
+        }
+
+        // ส่งการ์ดแจ้งผลความสำเร็จให้ครู
+        const successCard = {
+          type: 'bubble', size: 'mega',
+          header: {
+            type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '16px',
+            contents: [
+              { type: 'text', text: '✅ อนุมัติผลการเรียนสำเร็จ!', color: '#FFFFFF', size: 'lg', weight: 'bold' },
+              { type: 'text', text: 'โรงเรียนอุเทนพัฒนา (UTP Smart)', color: '#E8F5E9', size: 'xs' }
+            ]
+          },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '16px',
+            contents: [
+              { type: 'text', text: `👤 นักเรียน: ${reqData.studentName} (${reqData.studentClass || ''})`, size: 'sm', weight: 'bold' },
+              { type: 'text', text: `📚 วิชา: ${reqData.subjectCode} ${reqData.subjectName || ''}`, size: 'sm' },
+              { type: 'text', text: `⭐ เกรดใหม่: ${grade} (ผลเดิม: ${reqData.gradeType})`, size: 'md', weight: 'bold', color: '#0B6623' },
+              { type: 'separator', margin: 'md' },
+              { type: 'text', text: '📌 สถานะ: บันทึกลงระบบและส่งต่อฝ่ายวัดผลเรียบร้อยแล้ว ขอบคุณครับ/ค่ะ', size: 'xs', color: '#555555', wrap: true }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', paddingAll: '10px',
+            contents: [
+              {
+                type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
+                action: { type: 'uri', label: '🌐 เปิดห้องทำงานครู (Auto-Login)', uri: generateMagicLink(reqData.teacherId) }
+              }
+            ]
+          }
+        };
+
+        await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'อนุมัติเกรดสำเร็จ', contents: successCard }]);
+        return;
+      } catch (err) {
+        console.error('Approve error:', err);
+        await sendLineReply(event.replyToken, [{ type: 'text', text: 'เกิดข้อผิดพลาดในการอนุมัติ: ' + err.message }]);
+        return;
+      }
+    }
+
+    // B: ครูต้องการสั่งงานนักเรียนผ่านแชต
+    if (action === 'assign_prompt') {
+      const reqId = params.get('reqId');
+      if (!db) return;
+
+      const reqDoc = await db.collection('requests').doc(reqId).get();
+      if (!reqDoc.exists) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: '❌ ไม่พบคำร้องนี้' }]);
+        return;
+      }
+
+      const reqData = reqDoc.data();
+      pendingWorkAssignment.set(userId, { reqId, reqData, timestamp: Date.now() });
+
+      await sendLineReply(event.replyToken, [{
+        type: 'text',
+        text: `📝 สั่งงานนักเรียน\nวิชา: ${reqData.subjectCode} (${reqData.studentName})\n\nกรุณาพิมพ์รายละเอียดงานที่ต้องการมอบหมายในช่องแชตนี้ได้เลยครับ เช่น:\n"งาน: ให้ทำแบบฝึกหัดบทที่ 3 ข้อ 1-10 ส่งภายในวันศุกร์นี้"`
+      }]);
+      return;
+    }
+  }
+
+  // ── 3. Event: ผู้ใช้ส่งข้อความ (Message) ──
   if (event.type === 'message' && event.message.type === 'text') {
     const rawText = (event.message.text || '').trim();
     const text = rawText.toLowerCase();
+
+    // ── ตรวจสอบว่ามี Session สั่งงานค้างอยู่หรือไม่ ──
+    if (pendingWorkAssignment.has(userId)) {
+      const session = pendingWorkAssignment.get(userId);
+      // เช็คหมดอายุ 10 นาที
+      if (Date.now() - session.timestamp < 10 * 60 * 1000) {
+        if (!rawText.startsWith('ยกเลิก')) {
+          const reqId = session.reqId;
+          const reqData = session.reqData;
+          const assignmentDetails = rawText.replace(/^งาน\s*:\s*/i, '').trim();
+
+          const teacherDoc = await db.collection('teachers').doc(reqData.teacherId).get();
+          const teacherName = teacherDoc.exists ? (teacherDoc.data().name || 'คุณครู') : 'คุณครู';
+
+          const updatedLogs = [
+            ...(reqData.auditLogs || []),
+            {
+              action: 'assigned_work',
+              actorName: teacherName,
+              actorRole: 'teacher',
+              details: `มอบหมายงานผ่าน LINE OA: ${assignmentDetails}`,
+              timestamp: new Date().toISOString()
+            }
+          ];
+
+          await db.collection('requests').doc(reqId).update({
+            status: 'assigned_work',
+            assignmentDetails: assignmentDetails,
+            assignedAt: new Date().toISOString(),
+            assignedVia: 'LINE_OA',
+            auditLogs: updatedLogs
+          });
+
+          pendingWorkAssignment.delete(userId);
+
+          // ส่งแจ้งเตือนนักเรียน (ถ้ามี lineUserId)
+          try {
+            const studentDoc = await db.collection('students').doc(reqData.studentId).get();
+            if (studentDoc.exists && studentDoc.data().lineUserId) {
+              const studentFlex = buildStudentFlex({
+                ...reqData,
+                status: 'assigned_work',
+                assignmentDetails: assignmentDetails
+              });
+              await sendLineFlexMessage(
+                studentDoc.data().lineUserId,
+                `📢 คุณครูสั่งงานวิชา ${reqData.subjectCode} แล้ว!`,
+                studentFlex
+              );
+            }
+          } catch (sErr) {
+            console.warn('Student notify err:', sErr.message);
+          }
+
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: `✅ บันทึกการมอบหมายงานเรียบร้อยแล้วครับ!\n\n📚 วิชา: ${reqData.subjectCode}\n👤 นักเรียน: ${reqData.studentName}\n📝 งาน: ${assignmentDetails}\n\nระบบได้ส่งการแจ้งเตือนไปยังนักเรียนแล้วครับ`
+          }]);
+          return;
+        } else {
+          pendingWorkAssignment.delete(userId);
+          await sendLineReply(event.replyToken, [{ type: 'text', text: 'ยกเลิกการสั่งงานเรียบร้อยแล้วครับ' }]);
+          return;
+        }
+      } else {
+        pendingWorkAssignment.delete(userId);
+      }
+    }
+
+    // ── ตรวจสอบว่ามี Session กรอก PIN ครู ค้างอยู่หรือไม่ ──
+    if (pendingPinVerification.has(userId)) {
+      const session = pendingPinVerification.get(userId);
+      if (Date.now() - session.timestamp < 10 * 60 * 1000) {
+        // เช็คว่าผู้ใช้กรอก PIN 4 หลักมาหรือไม่
+        const pinMatch = rawText.match(/^\d{4}$/) || rawText.match(/^pin\s*(\d{4})$/i);
+        if (pinMatch) {
+          const inputPin = pinMatch[1] || pinMatch[0];
+          const matchedTeacher = session.teacher;
+
+          if (matchedTeacher.pin === inputPin) {
+            // รหัสถูกต้อง! ผูกบัญชีสำเร็จ
+            pendingPinVerification.delete(userId);
+
+            await db.collection('teachers').doc(matchedTeacher.id).update({
+              lineUserId: userId,
+              lineLinkedAt: new Date().toISOString()
+            });
+
+            // ตรวจสอบคำร้องค้าง
+            const pendingSnap = await db.collection('requests')
+              .where('teacherId', '==', matchedTeacher.id)
+              .where('status', '==', 'pending')
+              .get();
+            const pendingCount = pendingSnap.size;
+
+            const successFlex = {
+              type: 'bubble', size: 'mega',
+              header: {
+                type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '16px',
+                contents: [
+                  { type: 'text', text: '✅ ยืนยันตัวตนสำเร็จ!', color: '#FFFFFF', size: 'lg', weight: 'bold' },
+                  { type: 'text', text: 'โรงเรียนอุเทนพัฒนา (UTP Smart)', color: '#E8F5E9', size: 'xs' },
+                ]
+              },
+              body: {
+                type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+                contents: [
+                  { type: 'text', text: `ยินดีต้อนรับ ${matchedTeacher.name}`, size: 'md', weight: 'bold' },
+                  { type: 'text', text: `กลุ่มสาระฯ: ${matchedTeacher.department || '-'}`, size: 'xs', color: '#888888' },
+                  {
+                    type: 'box', layout: 'vertical', backgroundColor: pendingCount > 0 ? '#FFF3E0' : '#E8F5E9', paddingAll: '12px', cornerRadius: 'md',
+                    contents: [
+                      {
+                        type: 'text',
+                        text: pendingCount > 0 ? `⚠️ มีคำร้องรอคุณครูตรวจสอบ ${pendingCount} รายการ` : '🎉 ไม่มีคำร้องค้างตรวจในขณะนี้',
+                        size: 'sm', weight: 'bold', color: pendingCount > 0 ? '#E65100' : '#0B6623'
+                      },
+                      { type: 'text', text: 'ท่านสามารถอนุมัติเกรด หรือคลิก Auto-Login เข้าห้องทำงานครูได้ทันทีครับ', size: 'xs', color: '#666666' }
+                    ]
+                  }
+                ]
+              },
+              footer: {
+                type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+                contents: [
+                  ...(pendingCount > 0 ? [{
+                    type: 'button', style: 'primary', color: '#E65100', height: 'sm',
+                    action: { type: 'message', label: `📋 ดูรายการค้าง (${pendingCount})`, text: 'คำร้องค้าง' }
+                  }] : []),
+                  {
+                    type: 'button', style: 'secondary', height: 'sm',
+                    action: {
+                      type: 'uri',
+                      label: '🌐 เปิดห้องทำงานครู (Auto-Login)',
+                      uri: generateMagicLink(matchedTeacher.id)
+                    }
+                  }
+                ]
+              }
+            };
+
+            await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีครูสำเร็จ', contents: successFlex }]);
+            return;
+          } else {
+            await sendLineReply(event.replyToken, [{
+              type: 'text',
+              text: `❌ รหัส PIN 4 หลักไม่ถูกต้องครับ\n\nกรุณาตรวจสอบรหัส PIN ของ ${matchedTeacher.name} แล้วลองพิมพ์ใหม่อีกครั้งครับ (หรือพิมพ์ "ยกเลิก")`
+            }]);
+            return;
+          }
+        }
+      } else {
+        pendingPinVerification.delete(userId);
+      }
+    }
 
     // ── ตรวจสอบว่าบัญชีนี้ผูกกับใครอยู่แล้วหรือยัง ──
     let linkedUser = null;
@@ -332,13 +691,25 @@ async function handleLineEvent(event) {
       return;
     }
 
-    // B: ผูกบัญชีครู (พิมพ์ "ครู [ชื่อ]" หรือ "ผูกบัญชีครู [ชื่อ]" หรือ "ลงทะเบียนครู [ชื่อ]")
+    // B: ผูกบัญชีครู (พร้อม PIN ป้องกันแอบอ้าง)
+    // รูปแบบ 1: "ครู ศิรชัช 2108"
+    // รูปแบบ 2: "ครู ศิรชัช" -> แล้วบอทถาม PIN
     if (rawText.startsWith('ครู') || rawText.startsWith('ผูกบัญชีครู') || rawText.startsWith('ลงทะเบียนครู') || rawText.startsWith('อาจารย์')) {
-      const keyword = rawText.replace(/^(ครู|ผูกบัญชีครู|ลงทะเบียนครู|อาจารย์)\s*/, '').trim();
+      const cleaned = rawText.replace(/^(ครู|ผูกบัญชีครู|ลงทะเบียนครู|อาจารย์)\s*/, '').trim();
+      
+      // ดึงรหัส PIN ออกมาหากพิมพ์มาด้วย เช่น "ศิรชัช 2108"
+      const pinInlineMatch = cleaned.match(/\s+(\d{4})$/);
+      let keyword = cleaned;
+      let inlinePin = null;
+      if (pinInlineMatch) {
+        inlinePin = pinInlineMatch[1];
+        keyword = cleaned.substring(0, cleaned.length - pinInlineMatch[0].length).trim();
+      }
+
       if (!keyword) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: 'กรุณาระบุชื่อของคุณครูด้วยครับ เช่น:\n"ครู ศิรชัช" หรือ "ครู นุชนารถ"'
+          text: 'กรุณาระบุชื่อของคุณครูด้วยครับ เช่น:\n"ครู ศิรชัช 2108" หรือ "ครู นุชนารถ"'
         }]);
         return;
       }
@@ -362,67 +733,89 @@ async function handleLineEvent(event) {
       if (!matchedTeacher) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: `❌ ไม่พบข้อมูลคุณครูที่ตรงกับ "${keyword}"\nกรุณาพิมพ์ชื่อ-นามสกุลให้ชัดเจน หรือติดต่อฝ่ายวัดผลครับ`
+          text: `❌ ไม่พบข้อมูลคุณครูที่ตรงกับ "${keyword}"\nกรุณาพิมพ์ชื่อจริงให้ชัดเจน หรือติดต่อฝ่ายวัดผลครับ`
         }]);
         return;
       }
 
-      // บันทึก lineUserId ลงในเอกสารครู
-      await db.collection('teachers').doc(matchedTeacher.id).update({
-        lineUserId: userId,
-        lineLinkedAt: new Date().toISOString()
-      });
+      // กรณีครูพิมพ์ PIN มาพร้อมกันในคำสั่งเดียว เช่น "ครู ศิรชัช 2108"
+      if (inlinePin) {
+        if (matchedTeacher.pin === inlinePin) {
+          // ถูกต้อง! ผูกสำเร็จทันที
+          await db.collection('teachers').doc(matchedTeacher.id).update({
+            lineUserId: userId,
+            lineLinkedAt: new Date().toISOString()
+          });
 
-      // ตรวจสอบว่ามีคำร้องค้างอยู่กี่รายการ
-      const pendingSnap = await db.collection('requests')
-        .where('teacherId', '==', matchedTeacher.id)
-        .where('status', '==', 'pending')
-        .get();
-      const pendingCount = pendingSnap.size;
+          const pendingSnap = await db.collection('requests')
+            .where('teacherId', '==', matchedTeacher.id)
+            .where('status', '==', 'pending')
+            .get();
+          const pendingCount = pendingSnap.size;
 
-      const successFlex = {
-        type: 'bubble', size: 'mega',
-        header: {
-          type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '16px',
-          contents: [
-            { type: 'text', text: '✅ ผูกบัญชีครูสำเร็จ!', color: '#FFFFFF', size: 'lg', weight: 'bold' },
-            { type: 'text', text: 'โรงเรียนอุเทนพัฒนา (UTP Smart)', color: '#E8F5E9', size: 'xs' },
-          ]
-        },
-        body: {
-          type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
-          contents: [
-            { type: 'text', text: `ยินดีต้อนรับ ${matchedTeacher.name || matchedTeacher.teacherName}`, size: 'md', weight: 'bold' },
-            { type: 'text', text: `รหัสครู: ${matchedTeacher.id}`, size: 'xs', color: '#888888' },
-            {
-              type: 'box', layout: 'vertical', backgroundColor: pendingCount > 0 ? '#FFF3E0' : '#E8F5E9', paddingAll: '12px', cornerRadius: 'md',
+          const successFlex = {
+            type: 'bubble', size: 'mega',
+            header: {
+              type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '16px',
               contents: [
+                { type: 'text', text: '✅ ยืนยันตัวตนสำเร็จ!', color: '#FFFFFF', size: 'lg', weight: 'bold' },
+                { type: 'text', text: 'โรงเรียนอุเทนพัฒนา (UTP Smart)', color: '#E8F5E9', size: 'xs' },
+              ]
+            },
+            body: {
+              type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+              contents: [
+                { type: 'text', text: `ยินดีต้อนรับ ${matchedTeacher.name}`, size: 'md', weight: 'bold' },
+                { type: 'text', text: `กลุ่มสาระฯ: ${matchedTeacher.department || '-'}`, size: 'xs', color: '#888888' },
                 {
-                  type: 'text',
-                  text: pendingCount > 0 ? `⚠️ มีคำร้องรอคุณครูตรวจสอบ ${pendingCount} รายการ` : '🎉 ไม่มีคำร้องค้างตรวจในขณะนี้',
-                  size: 'sm', weight: 'bold', color: pendingCount > 0 ? '#E65100' : '#0B6623'
-                },
-                { type: 'text', text: 'ระบบจะส่งการแจ้งเตือนทันทีเมื่อมีนักเรียนยื่นคำร้องใหม่เข้ามาครับ', size: 'xs', color: '#666666' }
+                  type: 'box', layout: 'vertical', backgroundColor: pendingCount > 0 ? '#FFF3E0' : '#E8F5E9', paddingAll: '12px', cornerRadius: 'md',
+                  contents: [
+                    {
+                      type: 'text',
+                      text: pendingCount > 0 ? `⚠️ มีคำร้องรอคุณครูตรวจสอบ ${pendingCount} รายการ` : '🎉 ไม่มีคำร้องค้างตรวจในขณะนี้',
+                      size: 'sm', weight: 'bold', color: pendingCount > 0 ? '#E65100' : '#0B6623'
+                    },
+                    { type: 'text', text: 'ท่านสามารถอนุมัติเกรด หรือคลิก Auto-Login เข้าห้องทำงานครูได้ทันทีครับ', size: 'xs', color: '#666666' }
+                  ]
+                }
+              ]
+            },
+            footer: {
+              type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+              contents: [
+                ...(pendingCount > 0 ? [{
+                  type: 'button', style: 'primary', color: '#E65100', height: 'sm',
+                  action: { type: 'message', label: `📋 ดูรายการค้าง (${pendingCount})`, text: 'คำร้องค้าง' }
+                }] : []),
+                {
+                  type: 'button', style: 'secondary', height: 'sm',
+                  action: {
+                    type: 'uri',
+                    label: '🌐 เปิดห้องทำงานครู (Auto-Login)',
+                    uri: generateMagicLink(matchedTeacher.id)
+                  }
+                }
               ]
             }
-          ]
-        },
-        footer: {
-          type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
-          contents: [
-            ...(pendingCount > 0 ? [{
-              type: 'button', style: 'primary', color: '#E65100', height: 'sm',
-              action: { type: 'message', label: `📋 ดูรายการค้าง (${pendingCount})`, text: 'คำร้องค้าง' }
-            }] : []),
-            {
-              type: 'button', style: 'secondary', height: 'sm',
-              action: { type: 'uri', label: '🏠 เข้าสู่ระบบครู', uri: BASE_URL + '/?page=teacher-portal' }
-            }
-          ]
-        }
-      };
+          };
 
-      await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีครูสำเร็จ', contents: successFlex }]);
+          await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีครูสำเร็จ', contents: successFlex }]);
+          return;
+        } else {
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: `❌ รหัส PIN 4 หลักไม่ถูกต้องครับ เพื่อความปลอดภัย กรุณาตรวจสอบรหัส PIN ประจำตัวของคุณครูอีกครั้งครับ`
+          }]);
+          return;
+        }
+      }
+
+      // กรณีครูยังไม่ได้ใส่ PIN มาด้วย -> บอทถาม PIN เพื่อยืนยันตัวตน 2 ชั้น
+      pendingPinVerification.set(userId, { teacher: matchedTeacher, timestamp: Date.now() });
+      await sendLineReply(event.replyToken, [{
+        type: 'text',
+        text: `🔐 เพื่อความปลอดภัยและป้องกันการแอบอ้าง\n\nกรุณาพิมพ์รหัส PIN 4 หลักประจำตัวของ "${matchedTeacher.name}" เพื่อยืนยันตัวตนครับ\n(เช่น พิมพ์ตัวเลข 4 หลักส่งมาได้เลยครับ)`
+      }]);
       return;
     }
 
@@ -494,12 +887,12 @@ async function handleLineEvent(event) {
       return;
     }
 
-    // D: ตรวจสอบคำร้องค้าง (สำหรับครู)
+    // D: ตรวจสอบคำร้องค้าง (สำหรับครู พร้อมปุ่ม Magic Link & อนุมัติในแชต)
     if (text === 'คำร้องค้าง' || text === 'งานค้าง' || text === 'รอตรวจ' || text === 'ตรวจคำร้อง') {
       if (!linkedUser || linkedUser.role !== 'teacher') {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: '⚠️ ท่านยังไม่ได้ผูกบัญชีครู กรุณาพิมพ์:\n"ครู [ชื่อของคุณครู]"\nเช่น "ครู ศิรชัช" เพื่อเชื่อมโยงบัญชีก่อนครับ'
+          text: '⚠️ ท่านยังไม่ได้ผูกบัญชีครู กรุณาพิมพ์:\n"ครู [ชื่อ] [PIN]"\nเช่น "ครู ศิรชัช 2108" เพื่อยืนยันตัวตนก่อนครับ'
         }]);
         return;
       }
@@ -507,7 +900,7 @@ async function handleLineEvent(event) {
       if (!db) return;
       const pendingSnap = await db.collection('requests')
         .where('teacherId', '==', linkedUser.id)
-        .where('status', '==', 'pending')
+        .where('status', 'in', ['pending', 'assigned_work', 'pending_teacher'])
         .get();
 
       if (pendingSnap.empty) {
@@ -518,39 +911,20 @@ async function handleLineEvent(event) {
         return;
       }
 
-      // สร้าง Flex Carousel แสดงคำร้องค้าง (สูงสุด 5 รายการ)
+      // สร้าง Flex Carousel แสดงคำร้องค้าง (สูงสุด 5 รายการ) พร้อมปุ่มอนุมัติ
       const bubbles = [];
       let count = 0;
       pendingSnap.forEach(doc => {
         if (count >= 5) return;
-        const r = doc.data();
-        const verifyUrl = `${BASE_URL}/?page=verify&token=${r.qrToken || ''}`;
-        bubbles.push({
-          type: 'bubble', size: 'micro',
-          header: {
-            type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '8px',
-            contents: [{ type: 'text', text: `วิชา ${r.subjectCode}`, color: '#FFFFFF', size: 'xs', weight: 'bold' }]
-          },
-          body: {
-            type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '8px',
-            contents: [
-              { type: 'text', text: r.studentName || '-', size: 'xxs', weight: 'bold', wrap: true },
-              { type: 'text', text: `${r.studentClass || ''} | ผลเดิม ${r.gradeType}`, size: 'xxs', color: '#CC0000' },
-              { type: 'text', text: `ภาค ${r.semester || '-'}`, size: 'xxs', color: '#888888' },
-            ]
-          },
-          footer: {
-            type: 'box', layout: 'vertical', paddingAll: '6px',
-            contents: [
-              { type: 'button', style: 'primary', color: '#0B6623', height: 'sm', action: { type: 'uri', label: '✅ ตรวจสอบ', uri: verifyUrl } }
-            ]
-          }
-        });
+        const r = { id: doc.id, ...doc.data() };
+        const magicUrl = generateMagicLink(linkedUser.id, r.id);
+        const card = buildTeacherFlex(r, magicUrl);
+        bubbles.push(card);
         count++;
       });
 
       await sendLineReply(event.replyToken, [
-        { type: 'text', text: `📋 พบคำร้องค้างตรวจ ${pendingSnap.size} รายการ (แสดง ${count} รายการล่าสุด):` },
+        { type: 'text', text: `📋 พบคำร้องรอคุณครูตรวจ ${pendingSnap.size} รายการ (สามารถกดปุ่มอนุมัติเกรดได้เลยที่การ์ดด้านล่างนี้ครับ):` },
         { type: 'flex', altText: 'รายการคำร้องค้าง', contents: { type: 'carousel', contents: bubbles } }
       ]);
       return;
@@ -581,6 +955,7 @@ async function handleLineEvent(event) {
 
       const statusMap = {
         pending: '🟡 รอครูตรวจสอบ',
+        pending_teacher: '🟡 รอครูตรวจสอบ',
         assigned_work: '🟣 ครูสั่งงานแล้ว (ส่งงานด่วน)',
         teacher_approved: '🔵 ครูอนุมัติแล้ว (รอวัดผล)',
         completed: '🟢 แก้ไขสำเร็จเรียบร้อย',
@@ -593,6 +968,7 @@ async function handleLineEvent(event) {
         const st = statusMap[r.status] || r.status;
         statusMsg += `\n• ${r.subjectCode} (${r.gradeType}) : ${st}`;
         if (r.newGrade) statusMsg += ` -> เกรดใหม่: ${r.newGrade}`;
+        if (r.assignmentDetails) statusMsg += `\n  (งานที่สั่ง: ${r.assignmentDetails})`;
       });
 
       await sendLineReply(event.replyToken, [
@@ -618,12 +994,12 @@ async function handleLineEvent(event) {
     if (text === 'วิธีผูกบัญชี' || text === 'วิธีใช้งาน' || text === 'ผูกบัญชี') {
       await sendLineReply(event.replyToken, [{
         type: 'text',
-        text: `📱 วิธีผูกบัญชีกับ UTP Smart\n\n🟢 สำหรับคุณครู:\nพิมพ์: ครู [ชื่อหรือนามสกุล]\nตัวอย่าง: ครู ศิรชัช\n\n🔵 สำหรับนักเรียน:\nพิมพ์: นักเรียน [รหัส 5 หลัก]\nตัวอย่าง: นักเรียน 12345\n\nเมื่อผูกแล้ว ระบบจะแจ้งเตือนเข้า LINE ของท่านโดยอัตโนมัติทันที!`
+        text: `📱 วิธีผูกบัญชีกับ UTP Smart\n\n🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN):\nพิมพ์: ครู [ชื่อ] [PIN 4 หลัก]\nตัวอย่าง: ครู ศิรชัช 2108\n\n🔵 สำหรับนักเรียน:\nพิมพ์: นักเรียน [รหัส 5 หลัก]\nตัวอย่าง: นักเรียน 12345\n\nเมื่อผูกแล้ว ท่านสามารถอนุมัติเกรดผ่านแชตได้ทันที หรือแตะ 1 คลิกเพื่อล็อกอินเข้าสู่ห้องทำงานครูอัตโนมัติ!`
       }]);
       return;
     }
 
-    // G: เมนูหลัก / Help / ข้อความอื่นๆ ที่ไม่เข้าเงื่อนไขข้างต้น
+    // G: เมนูหลัก / Help
     const menuFlex = buildMainMenuFlex(userId, linkedUser);
     await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'เมนูระบบ UTP Smart', contents: menuFlex }]);
   }
@@ -655,8 +1031,9 @@ app.post('/notify-teacher', async (req, res) => {
       return res.json({ sent: false, reason: 'Teacher has no LINE User ID set' });
     }
 
-    const verifyUrl = BASE_URL + '/?page=verify&token=' + reqData.qrToken;
-    const flex = buildTeacherFlex(reqData, verifyUrl);
+    // สร้าง Magic Link เฉพาะของครูคนนี้ พร้อมเจาะจง request ID
+    const magicUrl = generateMagicLink(teacherId, requestId || reqData.id);
+    const flex = buildTeacherFlex(reqData, magicUrl);
     const altText = '📋 คำร้องใหม่: ' + reqData.studentName + ' ขอแก้ไขวิชา ' + reqData.subjectCode + ' (' + reqData.gradeType + ')';
 
     await sendLineFlexMessage(lineUserId, altText, flex);
@@ -711,7 +1088,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'UTP Smart LINE Bot & Notifier',
-    version: '2.0.0',
+    version: '3.0.0',
     school: 'โรงเรียนอุเทนพัฒนา',
     time: new Date().toISOString()
   });
@@ -730,7 +1107,7 @@ app.get('/logs', (req, res) => {
 // ── Start Server ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log('🚀 UTP Smart LINE Bot & Notifier running on port ' + PORT);
+  console.log('🚀 UTP Smart LINE Bot & Notifier v3.0 running on port ' + PORT);
   console.log('✅ LINE Token configured:', !!LINE_TOKEN);
   console.log('✅ Base URL:', BASE_URL);
 });
