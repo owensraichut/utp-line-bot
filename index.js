@@ -50,6 +50,7 @@ function logEvent(tag, data) {
 
 // Session maps for interactive multi-step flows in LINE
 const pendingPinVerification = new Map(); // userId -> { teacher, timestamp }
+const pendingStudentPinVerification = new Map(); // userId -> { student, isSetup, timestamp }
 const pendingWorkAssignment = new Map();  // userId -> { reqId, reqData, timestamp }
 
 // ── Helper: สร้าง Magic Link (One-Tap Auto Login) ───────────────
@@ -668,6 +669,73 @@ async function handleLineEvent(event) {
       }
     }
 
+    // ── ตรวจสอบว่ามี Session กรอก PIN นักเรียน ค้างอยู่หรือไม่ (PDPA) ──
+    if (pendingStudentPinVerification.has(userId)) {
+      const session = pendingStudentPinVerification.get(userId);
+      if (Date.now() - session.timestamp < 10 * 60 * 1000) {
+        const pinMatch = rawText.match(/^\d{4}$/) || rawText.match(/^pin\s*(\d{4})$/i);
+        if (pinMatch) {
+          const inputPin = pinMatch[1] || pinMatch[0];
+          const matchedStudent = session.student;
+
+          if (!matchedStudent.pin || matchedStudent.pin === inputPin || session.isSetup) {
+            pendingStudentPinVerification.delete(userId);
+
+            const updateData = {
+              lineUserId: userId,
+              lineLinkedAt: new Date().toISOString()
+            };
+            if (!matchedStudent.pin || session.isSetup) updateData.pin = inputPin;
+
+            await db.collection('students').doc(matchedStudent.id).update(updateData);
+
+            const successStudentFlex = {
+              type: 'bubble', size: 'kilo',
+              header: {
+                type: 'box', layout: 'vertical', backgroundColor: '#1976D2', paddingAll: '14px',
+                contents: [
+                  { type: 'text', text: '✅ ยืนยันตัวตนสำเร็จ (PDPA)', color: '#FFFFFF', weight: 'bold', size: 'md' }
+                ]
+              },
+              body: {
+                type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px',
+                contents: [
+                  { type: 'text', text: `👤 ${matchedStudent.name}`, weight: 'bold', size: 'sm' },
+                  { type: 'text', text: `รหัส: ${matchedStudent.studentId || matchedStudent.id} | ชั้น ${matchedStudent.class || matchedStudent.studentClass || '-'}`, size: 'xs', color: '#666666' },
+                  { type: 'separator', margin: 'sm' },
+                  { type: 'text', text: 'ยืนยันรหัส PIN ถูกต้อง ระบบจะแจ้งเตือนผลผ่าน LINE ทันที!', size: 'xs', color: '#0B6623' }
+                ]
+              },
+              footer: {
+                type: 'box', layout: 'vertical', paddingAll: '10px',
+                contents: [
+                  { type: 'button', style: 'primary', color: '#1976D2', height: 'sm', action: { type: 'message', label: '📊 เช็คสถานะเกรด', text: 'เช็คเกรด' } }
+                ]
+              }
+            };
+
+            await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีนักเรียนสำเร็จ', contents: successStudentFlex }]);
+            return;
+          } else {
+            await sendLineReply(event.replyToken, [{
+              type: 'text',
+              text: `❌ รหัส PIN 4 หลักไม่ถูกต้องครับ\nเพื่อความปลอดภัย (PDPA) กรุณากรอกรหัส PIN ประจำตัวของ "${matchedStudent.name}" ให้ถูกต้องครับ (หรือพิมพ์ "ยกเลิก")`
+            }]);
+            return;
+          }
+        } else if (rawText.includes('ยกเลิก')) {
+          pendingStudentPinVerification.delete(userId);
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: 'ยกเลิกการยืนยันตัวตนนักเรียนเรียบร้อยแล้วครับ'
+          }]);
+          return;
+        }
+      } else {
+        pendingStudentPinVerification.delete(userId);
+      }
+    }
+
     // ── ตรวจสอบว่าบัญชีนี้ผูกกับใครอยู่แล้วหรือยัง ──
     let linkedUser = null;
     if (db) {
@@ -819,11 +887,20 @@ async function handleLineEvent(event) {
       return;
     }
 
-    // C: ผูกบัญชีนักเรียน (พิมพ์ "นักเรียน [รหัส]" หรือพิมพ์รหัส 5 หลัก)
-    if (rawText.startsWith('นักเรียน') || rawText.startsWith('ผูกบัญชีนักเรียน') || /^\d{5}$/.test(rawText)) {
-      const studentCode = rawText.replace(/^(นักเรียน|ผูกบัญชีนักเรียน)\s*/, '').trim();
+    // C: ผูกบัญชีนักเรียน (พร้อม PIN ป้องกันแอบดูเกรด PDPA)
+    // รูปแบบ 1: "นักเรียน 12345 1234" (รหัส 5 หลัก + PIN 4 หลัก)
+    // รูปแบบ 2: "นักเรียน 12345" หรือ "12345" -> บอทถามรหัส PIN 4 หลัก
+    if (rawText.startsWith('นักเรียน') || rawText.startsWith('ผูกบัญชีนักเรียน') || /^\d{5}(\s+\d{4})?$/.test(rawText)) {
+      const cleaned = rawText.replace(/^(นักเรียน|ผูกบัญชีนักเรียน)\s*/, '').trim();
+      const parts = cleaned.split(/\s+/);
+      const studentCode = parts[0];
+      const inlinePin = parts[1] && /^\d{4}$/.test(parts[1]) ? parts[1] : null;
+
       if (!studentCode) {
-        await sendLineReply(event.replyToken, [{ type: 'text', text: 'กรุณาระบุรหัสประจำตัวนักเรียน 5 หลัก เช่น: "นักเรียน 12345"' }]);
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: 'กรุณาระบุรหัสประจำตัวนักเรียน 5 หลัก เช่น:\n"นักเรียน 12345 1234" หรือ "นักเรียน 12345"'
+        }]);
         return;
       }
 
@@ -847,32 +924,27 @@ async function handleLineEvent(event) {
       if (!matchedStudent) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: `❌ ไม่พบข้อมูลนักเรียนรหัส "${studentCode}" ในระบบ\nกรุณาตรวจสอบรหัสประจำตัวอีกครั้งครับ`
+          text: `❌ ไม่พบข้อมูลนักเรียนรหัส "${studentCode}" ในระบบ\nกรุณาตรวจสอบรหัสประจำตัว 5 หลักอีกครั้งครับ`
         }]);
         return;
       }
 
-      // บันทึก lineUserId
-      await db.collection('students').doc(matchedStudent.id).update({
-        lineUserId: userId,
-        lineLinkedAt: new Date().toISOString()
-      });
-
-      const successStudentFlex = {
+      // ฟังก์ชันสร้าง Success Flex Card สำหรับนักเรียน
+      const buildSuccessFlex = (st) => ({
         type: 'bubble', size: 'kilo',
         header: {
           type: 'box', layout: 'vertical', backgroundColor: '#1976D2', paddingAll: '14px',
           contents: [
-            { type: 'text', text: '✅ ผูกบัญชีนักเรียนสำเร็จ', color: '#FFFFFF', weight: 'bold', size: 'md' }
+            { type: 'text', text: '✅ ยืนยันตัวตนสำเร็จ (PDPA)', color: '#FFFFFF', weight: 'bold', size: 'md' }
           ]
         },
         body: {
           type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px',
           contents: [
-            { type: 'text', text: `👤 ${matchedStudent.name}`, weight: 'bold', size: 'sm' },
-            { type: 'text', text: `รหัส: ${matchedStudent.studentId || matchedStudent.id} | ชั้น ${matchedStudent.class || matchedStudent.classroom || '-'}`, size: 'xs', color: '#666666' },
+            { type: 'text', text: `👤 ${st.name}`, weight: 'bold', size: 'sm' },
+            { type: 'text', text: `รหัส: ${st.studentId || st.id} | ชั้น ${st.class || st.studentClass || st.classroom || '-'}`, size: 'xs', color: '#666666' },
             { type: 'separator', margin: 'sm' },
-            { type: 'text', text: 'เมื่อคุณครูอนุมัติเกรดใหม่ ระบบจะแจ้งเตือนผลผ่าน LINE ทันที!', size: 'xs', color: '#0B6623' }
+            { type: 'text', text: '🔒 ยืนยันรหัส PIN ถูกต้อง ระบบจะแจ้งเตือนผลและงานมอบหมายผ่าน LINE ทันที!', size: 'xs', color: '#0B6623' }
           ]
         },
         footer: {
@@ -881,10 +953,46 @@ async function handleLineEvent(event) {
             { type: 'button', style: 'primary', color: '#1976D2', height: 'sm', action: { type: 'message', label: '📊 เช็คสถานะเกรด', text: 'เช็คเกรด' } }
           ]
         }
-      };
+      });
 
-      await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีนักเรียนสำเร็จ', contents: successStudentFlex }]);
-      return;
+      // กรณีที่ 1: นักเรียนพิมพ์ PIN มาพร้อมกันในคำสั่งเดียว เช่น "นักเรียน 12345 1234"
+      if (inlinePin) {
+        if (!matchedStudent.pin || matchedStudent.pin === inlinePin) {
+          const updateData = {
+            lineUserId: userId,
+            lineLinkedAt: new Date().toISOString()
+          };
+          if (!matchedStudent.pin) updateData.pin = inlinePin;
+
+          await db.collection('students').doc(matchedStudent.id).update(updateData);
+          await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีนักเรียนสำเร็จ', contents: buildSuccessFlex(matchedStudent) }]);
+          return;
+        } else {
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: `❌ รหัส PIN 4 หลักไม่ถูกต้องครับ\nเพื่อความปลอดภัยและคุ้มครองข้อมูลส่วนบุคคล (PDPA) กรุณาตรวจสอบรหัส PIN ประจำตัวของ "${matchedStudent.name}" ให้ถูกต้องครับ`
+          }]);
+          return;
+        }
+      }
+
+      // กรณีที่ 2: นักเรียนยังไม่ได้ใส่ PIN มาด้วย -> บอทถาม PIN เพื่อความปลอดภัย (PDPA)
+      if (matchedStudent.pin) {
+        pendingStudentPinVerification.set(userId, { student: matchedStudent, isSetup: false, timestamp: Date.now() });
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: `🔐 เพื่อความปลอดภัยและคุ้มครองข้อมูลส่วนบุคคล (PDPA)\n\nกรุณาพิมพ์รหัส PIN 4 หลักประจำตัวของ "${matchedStudent.name}" เพื่อยืนยันตัวตนครับ\n(พิมพ์ตัวเลข 4 หลักส่งมาได้เลยครับ หรือพิมพ์ "ยกเลิก")`
+        }]);
+        return;
+      } else {
+        // บัญชีนี้ในระบบยังไม่เคยตั้ง PIN
+        pendingStudentPinVerification.set(userId, { student: matchedStudent, isSetup: true, timestamp: Date.now() });
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: `🔐 บัญชีของ "${matchedStudent.name}" ยังไม่ได้ตั้งรหัส PIN ในระบบ\n\nเพื่อความปลอดภัย (PDPA) กรุณาพิมพ์ตัวเลข 4 หลักที่ต้องการใช้ เพื่อตั้งเป็นรหัส PIN ประจำตัวของคุณครับ (หรือพิมพ์ "ยกเลิก")`
+        }]);
+        return;
+      }
     }
 
     // D: ตรวจสอบคำร้องค้าง (สำหรับครู พร้อมปุ่ม Magic Link & อนุมัติในแชต)
@@ -935,7 +1043,7 @@ async function handleLineEvent(event) {
       if (!linkedUser || linkedUser.role !== 'student') {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: '💡 กรุณาผูกบัญชีนักเรียนก่อน โดยพิมพ์:\n"นักเรียน [รหัส 5 หลัก]"\nเช่น "นักเรียน 12345" ครับ'
+          text: '💡 กรุณาผูกบัญชีนักเรียนก่อน โดยพิมพ์:\n"นักเรียน [รหัส 5 หลัก] [PIN]"\nเช่น "นักเรียน 12345 1234" หรือพิมพ์ "นักเรียน 12345" แล้วรอระบบถาม PIN ครับ'
         }]);
         return;
       }
@@ -994,7 +1102,7 @@ async function handleLineEvent(event) {
     if (text === 'วิธีผูกบัญชี' || text === 'วิธีใช้งาน' || text === 'ผูกบัญชี') {
       await sendLineReply(event.replyToken, [{
         type: 'text',
-        text: `📱 วิธีผูกบัญชีกับ UTP Smart\n\n🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN):\nพิมพ์: ครู [ชื่อ] [PIN 4 หลัก]\nตัวอย่าง: ครู ศิรชัช 2108\n\n🔵 สำหรับนักเรียน:\nพิมพ์: นักเรียน [รหัส 5 หลัก]\nตัวอย่าง: นักเรียน 12345\n\nเมื่อผูกแล้ว ท่านสามารถอนุมัติเกรดผ่านแชตได้ทันที หรือแตะ 1 คลิกเพื่อล็อกอินเข้าสู่ห้องทำงานครูอัตโนมัติ!`
+        text: `📱 วิธีผูกบัญชีกับ UTP Smart\n\n🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN):\nพิมพ์: ครู [ชื่อ] [PIN 4 หลัก]\nตัวอย่าง: ครู ศิรชัช 2108\n\n🔵 สำหรับนักเรียน (PDPA ป้องกันแอบดูเกรด):\nพิมพ์: นักเรียน [รหัส 5 หลัก] [PIN 4 หลัก]\nตัวอย่าง: นักเรียน 12345 1234\n(หรือพิมพ์ "นักเรียน 12345" แล้วรอระบบถาม PIN ครับ)\n\nเมื่อผูกแล้ว ระบบจะแจ้งเตือนเมื่อครูอนุมัติเกรด/สั่งงาน และเช็คผลการแก้ตัวได้ตลอด 24 ชม. ครับ!`
       }]);
       return;
     }
