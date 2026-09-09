@@ -15,9 +15,41 @@ const express = require('express');
 const admin = require('firebase-admin');
 const axios = require('axios');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
+
+// ── CORS Middleware (Allow Web App Access) ───────────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// ── Email Transporter Setup (Gmail SMTP / Custom SMTP) ───────────
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '465');
+
+let mailTransporter = null;
+if (SMTP_USER && SMTP_PASS) {
+  mailTransporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+  console.log(`📧 Mail transporter ready for: ${SMTP_USER}`);
+} else {
+  console.log('ℹ️ SMTP credentials not set. Running email in sandbox/preview mode.');
+}
 
 // ── Firebase Admin Init ─────────────────────────────────────────
 let db;
@@ -1187,6 +1219,247 @@ app.post('/notify-student', async (req, res) => {
     res.json({ sent: true, studentId, lineUserId });
   } catch (err) {
     console.error('Notify student error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// EMAIL HELPERS & TEMPLATES
+// ════════════════════════════════════════════════════════════════
+async function sendSystemEmail({ to, subject, htmlText }) {
+  const fromName = 'โรงเรียนอุเทนพัฒนา (SGS Smart)';
+  const fromAddress = SMTP_USER || 'sgs.utenpatten@gmail.com';
+
+  if (!mailTransporter) {
+    console.log(`[EMAIL SANDBOX] To: ${to} | Subject: ${subject}`);
+    logEvent('EMAIL_SANDBOX', { to, subject });
+    return { sent: true, mode: 'sandbox', to, subject };
+  }
+
+  try {
+    const info = await mailTransporter.sendMail({
+      from: `"${fromName}" <${fromAddress}>`,
+      to,
+      subject,
+      html: htmlText,
+    });
+    console.log(`✅ Email sent successfully: ${info.messageId}`);
+    logEvent('EMAIL_SENT', { to, subject, messageId: info.messageId });
+    return { sent: true, messageId: info.messageId };
+  } catch (err) {
+    console.error(`❌ Failed to send email to ${to}:`, err.message);
+    logEvent('EMAIL_ERROR', { to, error: err.message });
+    throw err;
+  }
+}
+
+function buildPinResetEmailHtml({ name, role, otp, resetUrl }) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: 'Kanit', sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+    .container { max-width: 540px; margin: 0 auto; background: #1e293b; border-radius: 16px; border: 1px solid #334155; overflow: hidden; }
+    .header { background: linear-gradient(135deg, #064e3b, #047857); padding: 24px; text-align: center; }
+    .header h1 { color: #ffffff; margin: 0; font-size: 20px; font-weight: bold; }
+    .header p { color: #a7f3d0; margin: 4px 0 0 0; font-size: 13px; }
+    .content { padding: 24px; line-height: 1.6; }
+    .otp-box { background: #0f172a; border: 2px dashed #10b981; border-radius: 12px; padding: 18px; text-align: center; margin: 20px 0; }
+    .otp-code { font-size: 34px; font-weight: 800; letter-spacing: 6px; color: #34d399; font-family: monospace; }
+    .btn { display: inline-block; background: #10b981; color: #ffffff !important; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 15px; margin: 10px 0; }
+    .footer { background: #0f172a; padding: 16px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #334155; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🏫 โรงเรียนอุเทนพัฒนา</h1>
+      <p>ระบบแก้ไขผลการเรียนดิจิทัล (SGS อุเทนพัฒนา)</p>
+    </div>
+    <div class="content">
+      <p style="font-size: 16px; color: #e2e8f0; margin-top: 0;">เรียน <strong>${name}</strong> (${role === 'teacher' ? 'คุณครู' : 'นักเรียน'}),</p>
+      <p style="color: #94a3b8; font-size: 14px;">
+        ระบบได้รับคำขอตั้งค่ารหัส PIN ใหม่สำหรับเข้าสู่ระบบแก้ไขผลการเรียน กรุณานำรหัสยืนยันตัวตน (OTP) ด้านล่างนี้ไปกรอกในหน้าต่างรีเซ็ตรหัส:
+      </p>
+      <div class="otp-box">
+        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 6px;">รหัสยืนยัน OTP (หมดอายุใน 15 นาที)</div>
+        <div class="otp-code">${otp}</div>
+      </div>
+      <div style="text-align: center; margin: 20px 0;">
+        <a href="${resetUrl}" class="btn" target="_blank">🌐 หรือคลิกเพื่อเปลี่ยน PIN บนเว็บไซต์ทันที</a>
+      </div>
+      <p style="color: #64748b; font-size: 12px; line-height: 1.5;">
+        ⚠️ หากท่านไม่ได้เป็นผู้ส่งคำขอนี้ โปรดเพิกเฉยต่ออีเมลฉบับนี้ รหัส PIN เดิมของท่านจะยังคงปลอดภัยและไม่มีการเปลี่ยนแปลงใดๆ
+      </p>
+    </div>
+    <div class="footer">
+      กลุ่มบริหารวิชาการและงานวัดผล โรงเรียนอุเทนพัฒนา<br>
+      สำนักงานเขตพื้นที่การศึกษามัธยมศึกษานครพนม
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/request-pin-reset (ขอรหัส OTP ทางอีเมล)
+// Body: { role: 'teacher'|'student', identifier: phone|studentId, email: string }
+// ════════════════════════════════════════════════════════════════
+app.post('/api/request-pin-reset', async (req, res) => {
+  const { role, identifier, email } = req.body;
+  if (!role || !identifier || !email) {
+    return res.status(400).json({ error: 'กรุณาระบุข้อมูลให้ครบถ้วน' });
+  }
+
+  try {
+    if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+
+    let matchedUser = null;
+    if (role === 'teacher') {
+      const snap = await db.collection('teachers').get();
+      snap.forEach(doc => {
+        const d = doc.data();
+        if (doc.id === identifier || d.phone === identifier || (d.email && d.email.toLowerCase() === email.toLowerCase())) {
+          matchedUser = { id: doc.id, ...d };
+        }
+      });
+    } else {
+      const docSnap = await db.collection('students').doc(identifier).get();
+      if (docSnap.exists) {
+        matchedUser = { id: docSnap.id, ...docSnap.data() };
+      } else {
+        const q = await db.collection('students').where('studentId', '==', identifier).limit(1).get();
+        if (!q.empty) matchedUser = { id: q.docs[0].id, ...q.docs[0].data() };
+      }
+    }
+
+    if (!matchedUser) {
+      return res.status(404).json({ error: `ไม่พบข้อมูลผู้ใช้ในระบบ กรุณาตรวจสอบ${role === 'teacher' ? 'เบอร์โทรศัพท์' : 'รหัสนักเรียน'}` });
+    }
+
+    // สร้าง OTP 6 หลัก และ Reset Token
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const token = crypto.randomBytes(24).toString('hex');
+    const expiresAt = Date.now() + 15 * 60 * 1000; // 15 นาที
+
+    await db.collection('pin_resets').doc(token).set({
+      token,
+      otp,
+      role,
+      targetId: matchedUser.id,
+      name: matchedUser.name || matchedUser.teacherName || 'ผู้ใช้งาน',
+      email: email.trim().toLowerCase(),
+      expiresAt,
+      used: false,
+      createdAt: new Date().toISOString()
+    });
+
+    const resetUrl = `${BASE_URL}/?page=reset-pin&token=${token}`;
+    const emailHtml = buildPinResetEmailHtml({
+      name: matchedUser.name || matchedUser.teacherName || 'ผู้ใช้งาน',
+      role,
+      otp,
+      resetUrl
+    });
+
+    const emailRes = await sendSystemEmail({
+      to: email.trim(),
+      subject: `[UTP SGS] รหัสยืนยัน OTP สำหรับตั้งค่า PIN ใหม่ (${otp})`,
+      htmlText: emailHtml
+    });
+
+    res.json({
+      success: true,
+      message: `ส่งรหัส OTP 6 หลักไปยัง ${email} เรียบร้อยแล้ว (รหัสมีอายุ 15 นาที)`,
+      token,
+      expiresAt,
+      // กรณี sandbox mode แสดง OTP ให้ทดสอบได้สะดวก
+      ...(emailRes.mode === 'sandbox' ? { previewOtp: otp, isSandbox: true } : {})
+    });
+  } catch (err) {
+    console.error('request-pin-reset error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/verify-pin-reset (ยืนยัน OTP / Token และเปลี่ยน PIN ใหม่)
+// Body: { token?: string, otp?: string, identifier?: string, newPin: string }
+// ════════════════════════════════════════════════════════════════
+app.post('/api/verify-pin-reset', async (req, res) => {
+  const { token, otp, identifier, newPin } = req.body;
+  if (!newPin || !/^\d{4}$/.test(newPin)) {
+    return res.status(400).json({ error: 'รหัส PIN ใหม่ต้องเป็นตัวเลข 4 หลักเท่านั้น' });
+  }
+
+  try {
+    if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+
+    let resetDoc = null;
+    let resetDocId = null;
+
+    if (token) {
+      const snap = await db.collection('pin_resets').doc(token).get();
+      if (snap.exists) {
+        resetDoc = snap.data();
+        resetDocId = snap.id;
+      }
+    } else if (otp) {
+      const q = await db.collection('pin_resets')
+        .where('otp', '==', otp.trim())
+        .where('used', '==', false)
+        .limit(1)
+        .get();
+      if (!q.empty) {
+        resetDoc = q.docs[0].data();
+        resetDocId = q.docs[0].id;
+      }
+    }
+
+    if (!resetDoc) {
+      return res.status(400).json({ error: 'รหัสยืนยัน OTP หรือ Token ไม่ถูกต้อง' });
+    }
+
+    if (resetDoc.used) {
+      return res.status(400).json({ error: 'รหัสยืนยันนี้ถูกใช้งานไปแล้ว กรุณาขอใหม่อีกครั้ง' });
+    }
+
+    if (Date.now() > resetDoc.expiresAt) {
+      return res.status(400).json({ error: 'รหัสยืนยันนี้หมดอายุแล้ว (เกิน 15 นาที) กรุณาขอใหม่อีกครั้ง' });
+    }
+
+    // อัปเดต PIN ใน Firestore
+    const targetCollection = resetDoc.role === 'teacher' ? 'teachers' : 'students';
+    await db.collection(targetCollection).doc(resetDoc.targetId).update({
+      pin: newPin,
+      pinUpdatedAt: new Date().toISOString()
+    });
+
+    // มาร์ก resetDoc เป็น used
+    await db.collection('pin_resets').doc(resetDocId).update({
+      used: true,
+      usedAt: new Date().toISOString()
+    });
+
+    // บันทึก audit log
+    await db.collection('auditLogs').add({
+      action: 'PIN_RESET_EMAIL',
+      role: resetDoc.role,
+      targetId: resetDoc.targetId,
+      name: resetDoc.name,
+      email: resetDoc.email,
+      timestamp: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      message: `เปลี่ยนรหัส PIN สำหรับ ${resetDoc.name} สำเร็จเรียบร้อยแล้ว ท่านสามารถเข้าสู่ระบบด้วยรหัส PIN ใหม่ได้ทันทีครับ`,
+      role: resetDoc.role,
+      targetId: resetDoc.targetId
+    });
+  } catch (err) {
+    console.error('verify-pin-reset error:', err);
     res.status(500).json({ error: err.message });
   }
 });
