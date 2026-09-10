@@ -428,7 +428,7 @@ async function handleLineEvent(event) {
             type: 'box', layout: 'vertical', backgroundColor: '#F5F5F5', paddingAll: '12px', cornerRadius: 'md', spacing: 'xs',
             contents: [
               { type: 'text', text: '🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN 4 หลัก):', weight: 'bold', size: 'sm', color: '#0B6623' },
-              { type: 'text', text: 'พิมพ์ "ครู [ชื่อ] [PIN]" เช่น: ครู ศิรชัช 2108 เพื่อรับแจ้งเตือนและอนุมัติเกรดในแชต', size: 'xs', wrap: true },
+              { type: 'text', text: 'พิมพ์ "ครู [ชื่อ] [PIN]" เช่น: ครู สมชาย 1234 เพื่อรับแจ้งเตือนและอนุมัติเกรดในแชต', size: 'xs', wrap: true },
               { type: 'separator', margin: 'sm' },
               { type: 'text', text: '🔵 สำหรับนักเรียน:', weight: 'bold', size: 'sm', color: '#1976D2' },
               { type: 'text', text: 'พิมพ์ "นักเรียน [รหัส 5 หลัก]" เช่น: นักเรียน 12345 เพื่อติดตามสถานะ', size: 'xs', wrap: true },
@@ -1288,12 +1288,12 @@ async function handleLineEvent(event) {
     }
 
     // B: ผูกบัญชีครู (พร้อม PIN ป้องกันแอบอ้าง)
-    // รูปแบบ 1: "ครู ศิรชัช 2108"
-    // รูปแบบ 2: "ครู ศิรชัช" -> แล้วบอทถาม PIN
+    // รูปแบบ 1: "ครู สมชาย 1234"
+    // รูปแบบ 2: "ครู สมชาย" -> แล้วบอทถาม PIN
     if (rawText.startsWith('ครู') || rawText.startsWith('ผูกบัญชีครู') || rawText.startsWith('ลงทะเบียนครู') || rawText.startsWith('อาจารย์')) {
       const cleaned = rawText.replace(/^(ครู|ผูกบัญชีครู|ลงทะเบียนครู|อาจารย์)\s*/, '').trim();
       
-      // ดึงรหัส PIN ออกมาหากพิมพ์มาด้วย เช่น "ศิรชัช 2108"
+      // ดึงรหัส PIN ออกมาหากพิมพ์มาด้วย เช่น "สมชาย 1234"
       const pinInlineMatch = cleaned.match(/\s+(\d{4})$/);
       let keyword = cleaned;
       let inlinePin = null;
@@ -1305,7 +1305,7 @@ async function handleLineEvent(event) {
       if (!keyword) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: 'กรุณาระบุชื่อของคุณครูด้วยครับ เช่น:\n"ครู ศิรชัช 2108" หรือ "ครู นุชนารถ"'
+          text: 'กรุณาระบุชื่อของคุณครูด้วยครับ เช่น:\n"ครู สมชาย 1234" หรือ "ครู สมศรี"'
         }]);
         return;
       }
@@ -1334,7 +1334,7 @@ async function handleLineEvent(event) {
         return;
       }
 
-      // กรณีครูพิมพ์ PIN มาพร้อมกันในคำสั่งเดียว เช่น "ครู ศิรชัช 2108"
+      // กรณีครูพิมพ์ PIN มาพร้อมกันในคำสั่งเดียว เช่น "ครู สมชาย 1234"
       if (inlinePin) {
         if (matchedTeacher.pin === inlinePin) {
           // ถูกต้อง! ผูกสำเร็จทันที
@@ -1528,7 +1528,7 @@ async function handleLineEvent(event) {
       if (!linkedUser || linkedUser.role !== 'teacher') {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: '⚠️ ท่านยังไม่ได้ผูกบัญชีครู กรุณาพิมพ์:\n"ครู [ชื่อ] [PIN]"\nเช่น "ครู ศิรชัช 2108" เพื่อยืนยันตัวตนก่อนครับ'
+          text: '⚠️ ท่านยังไม่ได้ผูกบัญชีครู กรุณาพิมพ์:\n"ครู [ชื่อ] [PIN]"\nเช่น "ครู สมชาย 1234" เพื่อยืนยันตัวตนก่อนครับ'
         }]);
         return;
       }
@@ -1630,7 +1630,7 @@ async function handleLineEvent(event) {
     if (text === 'วิธีผูกบัญชี' || text === 'วิธีใช้งาน' || text === 'ผูกบัญชี') {
       await sendLineReply(event.replyToken, [{
         type: 'text',
-        text: `📱 วิธีผูกบัญชีกับ UTP Smart\n\n🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN):\nพิมพ์: ครู [ชื่อ] [PIN 4 หลัก]\nตัวอย่าง: ครู ศิรชัช 2108\n\n🔵 สำหรับนักเรียน (PDPA ป้องกันแอบดูเกรด):\nพิมพ์: นักเรียน [รหัส 5 หลัก] [PIN 4 หลัก]\nตัวอย่าง: นักเรียน 12345 1234\n(หรือพิมพ์ "นักเรียน 12345" แล้วรอระบบถาม PIN ครับ)\n\nเมื่อผูกแล้ว ระบบจะแจ้งเตือนเมื่อครูอนุมัติเกรด/สั่งงาน และเช็คผลการแก้ตัวได้ตลอด 24 ชม. ครับ!`
+        text: `📱 วิธีผูกบัญชีกับ UTP Smart\n\n🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN):\nพิมพ์: ครู [ชื่อ] [PIN 4 หลัก]\nตัวอย่าง: ครู สมชาย 1234\n\n🔵 สำหรับนักเรียน (PDPA ป้องกันแอบดูเกรด):\nพิมพ์: นักเรียน [รหัส 5 หลัก] [PIN 4 หลัก]\nตัวอย่าง: นักเรียน 12345 1234\n(หรือพิมพ์ "นักเรียน 12345" แล้วรอระบบถาม PIN ครับ)\n\nเมื่อผูกแล้ว ระบบจะแจ้งเตือนเมื่อครูอนุมัติเกรด/สั่งงาน และเช็คผลการแก้ตัวได้ตลอด 24 ชม. ครับ!`
       }]);
       return;
     }
