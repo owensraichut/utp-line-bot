@@ -532,6 +532,7 @@ async function handleLineEvent(event) {
                 type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '12px',
                 contents: [
                   { type: 'text', text: `👤 ${reqData.studentName}`, weight: 'bold', size: 'sm' },
+                  { type: 'text', text: `🆔 รหัส: ${reqData.studentId || '-'} • ชั้น ม.${reqData.studentClass || '-'}`, size: 'xs', color: '#2563EB', weight: 'bold' },
                   { type: 'text', text: `วิชา ${reqData.subjectCode} • ผู้ตรวจ: ${teacherName}`, size: 'xs', color: '#4B5563' },
                   { type: 'text', text: `เกรดที่อนุมัติ: ${grade}`, size: 'sm', weight: 'bold', color: '#2563EB' }
                 ]
@@ -699,6 +700,85 @@ async function handleLineEvent(event) {
       } catch(err) {
         console.error('admin_complete err:', err);
         await sendLineReply(event.replyToken, [{ type: 'text', text: 'เกิดข้อผิดพลาดในการบันทึก: ' + err.message }]);
+        return;
+      }
+    }
+
+    // D: ฝ่ายวัดผลปฏิเสธคำร้องผ่านแชต (In-Chat Rejection)
+    if (action === 'admin_reject') {
+      const reqId = params.get('reqId');
+      if (!db || !reqId) return;
+
+      let isSuper = false;
+      let staffUser = null;
+      const adminDoc = await db.collection('system_config').doc('admin').get();
+      if (adminDoc.exists) {
+        const aData = adminDoc.data();
+        const aList = aData.lineUserIds || (aData.lineUserId ? [aData.lineUserId] : []);
+        if (aList.includes(userId)) isSuper = true;
+      }
+      const staffSnap = await db.collection('admin_users').where('lineUserId', '==', userId).where('isActive', '==', true).limit(1).get();
+      if (!staffSnap.empty) staffUser = staffSnap.docs[0].data();
+
+      if (!isSuper && !staffUser) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: '⚠️ ขออภัยครับ ท่านไม่มีสิทธิ์ทำรายการนี้ (สงวนสิทธิ์สำหรับฝ่ายวัดผลและแอดมิน)' }]);
+        return;
+      }
+
+      const actorName = isSuper ? 'Super Admin (ผู้ดูแลระบบ)' : (staffUser.name + ' (เจ้าหน้าที่วัดผล)');
+      const actorRole = isSuper ? 'super_admin' : 'staff';
+
+      try {
+        const reqDoc = await db.collection('requests').doc(reqId).get();
+        if (!reqDoc.exists) {
+          await sendLineReply(event.replyToken, [{ type: 'text', text: '❌ ไม่พบข้อมูลคำร้องนี้' }]);
+          return;
+        }
+        const reqData = reqDoc.data();
+        const updatedLogs = [
+          ...(reqData.auditLogs || []),
+          {
+            action: 'rejected',
+            actorName: actorName,
+            actorRole: actorRole,
+            details: 'ฝ่ายวัดผลปฏิเสธคำร้องผ่าน LINE OA (In-Chat Rejection)',
+            timestamp: new Date().toISOString()
+          }
+        ];
+
+        await db.collection('requests').doc(reqId).update({
+          status: 'rejected',
+          rejectedAt: new Date().toISOString(),
+          adminNote: 'เจ้าหน้าที่วัดผลปฏิเสธคำร้องผ่าน LINE OA',
+          auditLogs: updatedLogs
+        });
+
+        // ส่งแจ้งเตือนนักเรียน (ถ้ามี lineUserId)
+        try {
+          const studentDoc = await db.collection('students').doc(reqData.studentId).get();
+          if (studentDoc.exists && studentDoc.data().lineUserId) {
+            const studentFlex = buildStudentFlex({
+              ...reqData,
+              status: 'rejected'
+            });
+            await sendLineFlexMessage(
+              studentDoc.data().lineUserId,
+              `📢 คำร้องแก้ไขผลการเรียนวิชา ${reqData.subjectCode} ถูกปฏิเสธ`,
+              studentFlex
+            );
+          }
+        } catch (sErr) {
+          console.warn('Notify student err:', sErr.message);
+        }
+
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: `❌ ปฏิเสธคำร้องวิชา ${reqData.subjectCode} ของ ${reqData.studentName} (รหัส: ${reqData.studentId}) เรียบร้อยแล้วครับ`
+        }]);
+        return;
+      } catch (err) {
+        console.error('admin_reject err:', err);
+        await sendLineReply(event.replyToken, [{ type: 'text', text: 'เกิดข้อผิดพลาดในการปฏิเสธคำร้อง: ' + err.message }]);
         return;
       }
     }
@@ -1235,7 +1315,14 @@ async function handleLineEvent(event) {
           body: {
             type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '12px',
             contents: [
-              { type: 'text', text: `👤 ${r.studentName || '-'} (ม.${r.studentClass || '-'})`, weight: 'bold', size: 'sm' },
+              { type: 'text', text: `👤 ${r.studentName || '-'}`, weight: 'bold', size: 'sm' },
+              {
+                type: 'box', layout: 'horizontal', margin: 'xs',
+                contents: [
+                  { type: 'text', text: `🆔 รหัส: ${r.studentId || '-'}`, size: 'xs', color: '#2563EB', weight: 'bold', flex: 1 },
+                  { type: 'text', text: `ชั้น ม.${r.studentClass || '-'}${r.studentNo ? ' (เลขที่ ' + r.studentNo + ')' : ''}`, size: 'xs', color: '#666666', align: 'end', flex: 1 }
+                ]
+              },
               { type: 'text', text: `ครูผู้ตรวจ: ${r.teacherName || '-'}`, size: 'xs', color: '#555555' },
               { type: 'separator', margin: 'xs' },
               {
@@ -1256,6 +1343,15 @@ async function handleLineEvent(event) {
                   type: 'postback',
                   label: '✅ บันทึกเสร็จสิ้น (จบงาน)',
                   data: `action=admin_complete&reqId=${r.id}`
+                }
+              },
+              {
+                type: 'button', style: 'secondary', color: '#DC2626', height: 'sm',
+                action: {
+                  type: 'postback',
+                  label: '❌ ปฏิเสธคำร้องนี้',
+                  data: `action=admin_reject&reqId=${r.id}`,
+                  displayText: `ปฏิเสธคำร้องวิชา ${r.subjectCode}`
                 }
               },
               {
