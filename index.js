@@ -84,6 +84,7 @@ function logEvent(tag, data) {
 const pendingPinVerification = new Map(); // userId -> { teacher, timestamp }
 const pendingStudentPinVerification = new Map(); // userId -> { student, isSetup, timestamp }
 const pendingWorkAssignment = new Map();  // userId -> { reqId, reqData, timestamp }
+const unknownMsgCooldown = new Map();     // userId -> lastReplyTimestamp (Anti-Spam Throttling)
 
 // ── Helper: สร้าง Magic Link (One-Tap Auto Login) ───────────────
 function generateAdminMagicLink(role = 'super', staffId = '') {
@@ -1634,9 +1635,31 @@ async function handleLineEvent(event) {
       return;
     }
 
-    // G: เมนูหลัก / Help
-    const menuFlex = buildMainMenuFlex(userId, userState);
-    await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'เมนูระบบ UTP Smart', contents: menuFlex }]);
+    // G: เมนูหลัก / Help / Anti-Spam Throttling
+    const lower = text.toLowerCase().trim();
+    const isMenuKeyword = ['เมนู', 'menu', 'ช่วยเหลือ', 'help', 'สอบถาม', 'เริ่ม', 'สวัสดี', 'hello', 'hi', 'คำสั่ง', 'บอท', 'bot'].includes(lower);
+
+    if (isMenuKeyword) {
+      const menuFlex = buildMainMenuFlex(userId, userState);
+      await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'เมนูระบบ UTP Smart', contents: menuFlex }]);
+      return;
+    }
+
+    // กรณีพิมพ์ข้อความอื่นทั่วไปที่บอทไม่เข้าใจ:
+    // Anti-Spam Throttling: หากเพิ่งตอบไปภายใน 15 วินาที จะเงียบ (Silent Ignore) เพื่อไม่ให้สแปมและไม่รกหน้าจอแชต
+    const lastReply = unknownMsgCooldown.get(userId) || 0;
+    const now = Date.now();
+    if (now - lastReply < 15000) {
+      // อยู่ในช่วง cooldown 15 วินาที -> เมินเฉย (ไม่ตอบกลับ ป้องกันคนพิมพ์แชตกวน หรือส่งข้อความรัวๆ)
+      return;
+    }
+    unknownMsgCooldown.set(userId, now);
+
+    // ตอบแจ้งสั้นๆ 1 ครั้ง พร้อมแนะนำคำว่า "เมนู"
+    await sendLineReply(event.replyToken, [{
+      type: 'text',
+      text: '🤖 ขออภัยครับ UTP Smart เป็นระบบอัตโนมัติ ไม่เข้าใจข้อความนี้\n\n📌 หากต้องการดูคำสั่งหรือเมนูการใช้งาน พิมพ์ "เมนู" ได้ตลอด 24 ชม. ครับ'
+    }]);
   }
 }
 
