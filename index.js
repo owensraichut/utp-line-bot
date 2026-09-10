@@ -962,17 +962,18 @@ async function handleLineEvent(event) {
       // 1. ตรวจสอบครู
       const teacherMatch = await db.collection('teachers').where('lineUserId', '==', userId).limit(1).get();
       if (!teacherMatch.empty) {
-        linkedTeacher = { id: teacherMatch.docs[0].id, ...teacherMatch.docs[0].data() };
+        linkedTeacher = { id: teacherMatch.docs[0].id, role: 'teacher', ...teacherMatch.docs[0].data() };
       }
-      // 2. ตรวจสอบนักเรียน
-      const studentMatch = await db.collection('students').where('lineUserId', '==', userId).limit(1).get();
+      // 2. ตรวจสอบนักเรียน (เรียงลำดับเอาบัญชีที่ผูกล่าสุด)
+      const studentMatch = await db.collection('students').where('lineUserId', '==', userId).get();
       if (!studentMatch.empty) {
-        linkedStudent = { id: studentMatch.docs[0].id, ...studentMatch.docs[0].data() };
+        const sortedStudentDocs = studentMatch.docs.sort((a, b) => (b.data().lineLinkedAt || '').localeCompare(a.data().lineLinkedAt || ''));
+        linkedStudent = { id: sortedStudentDocs[0].id, role: 'student', ...sortedStudentDocs[0].data() };
       }
       // 3. ตรวจสอบเจ้าหน้าที่วัดผล
       const staffMatch = await db.collection('admin_users').where('lineUserId', '==', userId).where('isActive', '==', true).limit(1).get();
       if (!staffMatch.empty) {
-        linkedStaff = { id: staffMatch.docs[0].id, ...staffMatch.docs[0].data() };
+        linkedStaff = { id: staffMatch.docs[0].id, role: 'staff', ...staffMatch.docs[0].data() };
       }
       // 4. ตรวจสอบ Super Admin
       const adminDoc = await db.collection('system_config').doc('admin').get();
@@ -1525,7 +1526,7 @@ async function handleLineEvent(event) {
 
     // D: ตรวจสอบคำร้องค้าง (สำหรับครู พร้อมปุ่ม Magic Link & อนุมัติในแชต)
     if (text === 'คำร้องค้าง' || text === 'งานค้าง' || text === 'รอตรวจ' || text === 'ตรวจคำร้อง') {
-      if (!linkedUser || linkedUser.role !== 'teacher') {
+      if (!linkedTeacher) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
           text: '⚠️ ท่านยังไม่ได้ผูกบัญชีครู กรุณาพิมพ์:\n"ครู [ชื่อ] [PIN]"\nเช่น "ครู สมชาย 1234" เพื่อยืนยันตัวตนก่อนครับ'
@@ -1535,14 +1536,14 @@ async function handleLineEvent(event) {
 
       if (!db) return;
       const pendingSnap = await db.collection('requests')
-        .where('teacherId', '==', linkedUser.id)
+        .where('teacherId', '==', linkedTeacher.id)
         .where('status', 'in', ['pending', 'assigned_work', 'pending_teacher'])
         .get();
 
       if (pendingSnap.empty) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: `🎉 คุณครู${linkedUser.name || ''} ไม่มีคำร้องค้างตรวจในขณะนี้ครับ!`
+          text: `🎉 คุณครู${linkedTeacher.name || ''} ไม่มีคำร้องค้างตรวจในขณะนี้ครับ!`
         }]);
         return;
       }
@@ -1553,7 +1554,7 @@ async function handleLineEvent(event) {
       pendingSnap.forEach(doc => {
         if (count >= 5) return;
         const r = { id: doc.id, ...doc.data() };
-        const magicUrl = generateMagicLink(linkedUser.id, r.id);
+        const magicUrl = generateMagicLink(linkedTeacher.id, r.id);
         const card = buildTeacherFlex(r, magicUrl);
         bubbles.push(card);
         count++;
@@ -1567,8 +1568,8 @@ async function handleLineEvent(event) {
     }
 
     // E: เช็คสถานะเกรด (สำหรับนักเรียน)
-    if (text === 'เช็คเกรด' || text === 'สถานะ' || text === 'เช็คสถานะ') {
-      if (!linkedUser || linkedUser.role !== 'student') {
+    if (text === 'เช็คเกรด' || text === 'สถานะ' || text === 'เช็คสถานะ' || text === 'ผลการเรียน' || text === 'ดูเกรด' || text === 'เกรด') {
+      if (!linkedStudent) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
           text: '💡 กรุณาผูกบัญชีนักเรียนก่อน โดยพิมพ์:\n"นักเรียน [รหัส 5 หลัก] [PIN]"\nเช่น "นักเรียน 12345 1234" หรือพิมพ์ "นักเรียน 12345" แล้วรอระบบถาม PIN ครับ'
@@ -1577,34 +1578,54 @@ async function handleLineEvent(event) {
       }
 
       if (!db) return;
-      const reqSnap = await db.collection('requests')
-        .where('studentId', '==', linkedUser.id)
+      const sId = linkedStudent.studentId || linkedStudent.id;
+      let reqSnap = await db.collection('requests')
+        .where('studentId', '==', sId)
         .get();
+
+      if (reqSnap.empty && linkedStudent.id && linkedStudent.id !== sId) {
+        reqSnap = await db.collection('requests')
+          .where('studentId', '==', linkedStudent.id)
+          .get();
+      }
 
       if (reqSnap.empty) {
         await sendLineReply(event.replyToken, [{
           type: 'text',
-          text: `น้อง ${linkedUser.name} ยังไม่มีประวัติการยื่นคำร้องแก้ผลการเรียนในระบบครับ`
+          text: `น้อง ${linkedStudent.name} ยังไม่มีประวัติการยื่นคำร้องแก้ผลการเรียนในระบบครับ\n(หรืออาจยังไม่ได้ส่งคำร้องแก้ 0, ร, มส เข้ามาครับ)`
+        }, {
+          type: 'flex', altText: 'ยื่นคำร้องแก้ผลการเรียน',
+          contents: {
+            type: 'bubble', size: 'kilo',
+            body: {
+              type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px',
+              contents: [
+                { type: 'text', text: `👤 ${linkedStudent.name} (รหัส ${sId})`, weight: 'bold', size: 'sm' },
+                { type: 'text', text: 'หากมีวิชาที่ติด 0, ร, มส สามารถคลิกเข้าสู่ระบบเพื่อยื่นคำร้องได้เลยครับ:', size: 'xs', color: '#666666' },
+                { type: 'button', style: 'primary', color: '#1976D2', height: 'sm', action: { type: 'uri', label: '📝 ยื่นคำร้องผ่านเว็บ', uri: BASE_URL } }
+              ]
+            }
+          }
         }]);
         return;
       }
 
       const statusMap = {
-        pending: '🟡 รอครูตรวจสอบ',
-        pending_teacher: '🟡 รอครูตรวจสอบ',
+        pending: '🟡 รอครูตรวจสอบ/สั่งงาน',
+        pending_teacher: '🟡 รอครูตรวจสอบ/สั่งงาน',
         assigned_work: '🟣 ครูสั่งงานแล้ว (ส่งงานด่วน)',
         teacher_approved: '🔵 ครูอนุมัติแล้ว (รอวัดผล)',
         completed: '🟢 แก้ไขสำเร็จเรียบร้อย',
         rejected: '🔴 คำร้องถูกปฏิเสธ'
       };
 
-      let statusMsg = `📊 ประวัติคำร้องของ ${linkedUser.name} (${reqSnap.size} รายการ):\n`;
+      let statusMsg = `📊 ประวัติคำร้องของ ${linkedStudent.name} (${reqSnap.size} รายการ):\n`;
       reqSnap.forEach(doc => {
         const r = doc.data();
         const st = statusMap[r.status] || r.status;
-        statusMsg += `\n• ${r.subjectCode} (${r.gradeType}) : ${st}`;
-        if (r.newGrade) statusMsg += ` -> เกรดใหม่: ${r.newGrade}`;
-        if (r.assignmentDetails) statusMsg += `\n  (งานที่สั่ง: ${r.assignmentDetails})`;
+        statusMsg += `\n• ${r.subjectCode || '-'} ${r.subjectName ? '(' + r.subjectName + ')' : ''} [${r.gradeType || '-'}] : ${st}`;
+        if (r.newGrade) statusMsg += ` ➡️ เกรดใหม่: ${r.newGrade}`;
+        if (r.assignmentDetails) statusMsg += `\n  📝 งาน: ${r.assignmentDetails}`;
       });
 
       await sendLineReply(event.replyToken, [
