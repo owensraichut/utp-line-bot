@@ -86,6 +86,14 @@ const pendingStudentPinVerification = new Map(); // userId -> { student, isSetup
 const pendingWorkAssignment = new Map();  // userId -> { reqId, reqData, timestamp }
 
 // ── Helper: สร้าง Magic Link (One-Tap Auto Login) ───────────────
+function generateAdminMagicLink(role = 'super', staffId = '') {
+  const timestamp = Date.now();
+  const aid = role === 'super' ? 'super' : staffId;
+  const raw = `${WEBHOOK_SECRET}:${aid}:${timestamp}`;
+  const sig = crypto.createHash('sha256').update(raw).digest('hex');
+  return `${BASE_URL}/?page=admin-verify&aid=${encodeURIComponent(aid)}&t=${timestamp}&sig=${sig}`;
+}
+
 function generateMagicLink(teacherId, requestId = '') {
   const timestamp = Date.now();
   const raw = `${WEBHOOK_SECRET}:${teacherId}:${timestamp}:${requestId}`;
@@ -256,66 +264,112 @@ function buildStudentFlex(req) {
   };
 }
 
-// ── Flex Card: เมนูหลัก (Main Menu) ──────────────────────────────
-function buildMainMenuFlex(userId, linkedUser) {
-  let statusText = 'ยังไม่ได้ผูกบัญชี';
-  let statusColor = '#E65100';
-  if (linkedUser) {
-    statusText = `ผูกกับ: ${linkedUser.name} (${linkedUser.role === 'teacher' ? 'คุณครู' : 'นักเรียน'})`;
-    statusColor = '#0B6623';
+// ── Flex Card: เมนูหลัก (Main Menu - Multi-Role Support) ──────────────────────
+function buildMainMenuFlex(userId, userState = {}) {
+  const { linkedTeacher, linkedStudent, linkedStaff, isSuperAdmin } = userState;
+
+  let roleBadges = [];
+  if (linkedTeacher) roleBadges.push(`🟢 ครู: ${linkedTeacher.name}`);
+  if (isSuperAdmin) roleBadges.push('🛡️ Super Admin');
+  if (linkedStaff) roleBadges.push(`👤 จนท. ${linkedStaff.name}`);
+  if (linkedStudent) roleBadges.push(`🔵 นักเรียน: ${linkedStudent.name}`);
+
+  let statusText = roleBadges.length > 0 ? roleBadges.join(' | ') : 'ยังไม่ได้ผูกบัญชี';
+  let statusColor = roleBadges.length > 0 ? '#0B6623' : '#E65100';
+
+  const menuButtons = [];
+
+  // Teacher actions
+  if (linkedTeacher) {
+    menuButtons.push({
+      type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
+      action: { type: 'message', label: '📋 ตรวจคำร้องค้าง (วิชาที่สอน)', text: 'คำร้องค้าง' }
+    });
+    menuButtons.push({
+      type: 'button', style: 'secondary', height: 'sm',
+      action: { type: 'uri', label: '🌐 เข้าห้องทำงานครู (Auto-Login)', uri: generateMagicLink(linkedTeacher.id) }
+    });
+  }
+
+  // Admin / Staff actions
+  if (isSuperAdmin || linkedStaff) {
+    menuButtons.push({
+      type: 'button', style: 'primary', color: '#1E293B', height: 'sm',
+      action: { type: 'message', label: '📊 ดูสถิติภาพรวมโรงเรียน', text: 'สถิติ' }
+    });
+    menuButtons.push({
+      type: 'button', style: 'primary', color: '#2563EB', height: 'sm',
+      action: { type: 'message', label: '🔵 รายการรอวัดผลดำเนินการ', text: 'รอวัดผล' }
+    });
+    menuButtons.push({
+      type: 'button', style: 'secondary', height: 'sm',
+      action: {
+        type: 'uri',
+        label: '🛠️ เข้า Dashboard แอดมิน (Auto-Login)',
+        uri: isSuperAdmin ? generateAdminMagicLink('super') : generateAdminMagicLink('staff', linkedStaff?.id || '')
+      }
+    });
+  }
+
+  // Student actions
+  if (linkedStudent) {
+    menuButtons.push({
+      type: 'button', style: 'primary', color: '#1976D2', height: 'sm',
+      action: { type: 'message', label: '📊 เช็คผลการเรียน (นักเรียน)', text: 'เช็คเกรด' }
+    });
+  }
+
+  // Fallback if not linked
+  if (!linkedTeacher && !isSuperAdmin && !linkedStaff && !linkedStudent) {
+    menuButtons.push({
+      type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
+      action: { type: 'message', label: '🟢 วิธีผูกบัญชีครู', text: 'วิธีผูกบัญชี' }
+    });
+    menuButtons.push({
+      type: 'button', style: 'secondary', height: 'sm',
+      action: { type: 'message', label: '🔵 วิธีผูกบัญชีนักเรียน', text: 'วิธีผูกบัญชี' }
+    });
+    menuButtons.push({
+      type: 'button', style: 'secondary', height: 'sm',
+      action: { type: 'message', label: '🛡️ วิธีผูกบัญชีแอดมิน/วัดผล', text: 'วิธีผูกบัญชี' }
+    });
+  } else {
+    menuButtons.push({
+      type: 'button', style: 'link', height: 'sm',
+      action: { type: 'message', label: '📖 ดูคำสั่งทั้งหมด', text: 'วิธีผูกบัญชี' }
+    });
   }
 
   return {
     type: 'bubble', size: 'mega',
     header: {
-      type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '16px',
+      type: 'box', layout: 'vertical', backgroundColor: isSuperAdmin ? '#BE123C' : (linkedTeacher ? '#0B6623' : '#1E293B'), paddingAll: '16px',
       contents: [
         { type: 'text', text: '🏫 UTP Smart — อุเทนพัฒนา', color: '#FFFFFF', size: 'lg', weight: 'bold' },
-        { type: 'text', text: 'ระบบแก้ไขผลการเรียนดิจิทัล (0, ร, มส)', color: '#E8F5E9', size: 'xs' },
+        { type: 'text', text: 'ระบบแก้ไขผลการเรียนดิจิทัล (0, ร, มส)', color: '#E8F5E9', size: 'xs' }
       ]
     },
     body: {
       type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
       contents: [
         {
-          type: 'box', layout: 'vertical', backgroundColor: '#F1F8E9', paddingAll: '10px', cornerRadius: 'md',
+          type: 'box', layout: 'vertical', backgroundColor: '#F8FAFC', paddingAll: '10px', cornerRadius: 'md',
           contents: [
-            { type: 'text', text: '📌 สถานะบัญชีของคุณ', size: 'xs', color: '#555555' },
+            { type: 'text', text: '📌 สถานะบัญชีของคุณ (Multi-Role Portal)', size: 'xs', color: '#64748B' },
             { type: 'text', text: statusText, size: 'sm', weight: 'bold', color: statusColor, wrap: true },
-            { type: 'text', text: `ID: ${userId.substring(0, 8)}...${userId.substring(userId.length - 4)}`, size: 'xxs', color: '#888888' },
+            { type: 'text', text: `ID: ${userId.substring(0, 8)}...${userId.substring(userId.length - 4)}`, size: 'xxs', color: '#94A3B8' }
           ]
         },
         {
           type: 'box', layout: 'vertical', spacing: 'sm',
-          contents: [
-            {
-              type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
-              action: { type: 'message', label: '📋 ตรวจสอบคำร้องค้าง (สำหรับครู)', text: 'คำร้องค้าง' }
-            },
-            {
-              type: 'button', style: 'secondary', height: 'sm',
-              action: { type: 'message', label: '📊 เช็คผลการเรียน (สำหรับนักเรียน)', text: 'เช็คเกรด' }
-            },
-            {
-              type: 'button', style: 'secondary', height: 'sm',
-              action: { type: 'message', label: '🔗 วิธีผูกบัญชีครู/นักเรียน', text: 'วิธีผูกบัญชี' }
-            },
-            {
-              type: 'button', style: 'link', height: 'sm',
-              action: {
-                type: 'uri',
-                label: '🌐 เปิดห้องทำงานครู (Auto-Login)',
-                uri: linkedUser && linkedUser.role === 'teacher' ? generateMagicLink(linkedUser.id) : BASE_URL
-              }
-            }
-          ]
+          contents: menuButtons
         }
       ]
     },
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '10px',
       contents: [
-        { type: 'text', text: 'พิมพ์ "คำร้องค้าง" หรือ "เช็คเกรด" เพื่อใช้งานด่วน', size: 'xxs', color: '#888888', align: 'center' }
+        { type: 'text', text: 'พิมพ์ "สถิติ", "รอวัดผล", "คำร้องค้าง" หรือ "เช็คเกรด" เพื่อใช้งานด่วน', size: 'xxs', color: '#888888', align: 'center' }
       ]
     }
   };
@@ -460,6 +514,37 @@ async function handleLineEvent(event) {
           auditLogs: updatedLogs
         });
 
+        // แจ้งเตือนฝ่ายวัดผลและผู้ดูแลระบบว่ามีเกรดรอลงทะเบียน
+        try {
+          const adminDoc = await db.collection('system_config').doc('admin').get();
+          const adminUsers = (adminDoc.exists && adminDoc.data()?.lineUserIds) || (adminDoc.exists && adminDoc.data()?.lineUserId ? [adminDoc.data().lineUserId] : []);
+          const staffSnap = await db.collection('admin_users').where('isActive', '==', true).get();
+          const staffUsers = [];
+          staffSnap.forEach(d => { if (d.data().lineUserId) staffUsers.push(d.data().lineUserId); });
+          const allStaff = Array.from(new Set([...adminUsers, ...staffUsers]));
+          for (const sId of allStaff) {
+            if (sId === userId) continue;
+            await sendLineFlexMessage(sId, `📢 ฝ่ายวัดผล: ครู ${teacherName} อนุมัติเกรด ${reqData.subjectCode} (${reqData.studentName}) แล้ว!`, {
+              type: 'bubble', size: 'kilo',
+              header: { type: 'box', layout: 'vertical', backgroundColor: '#2563EB', paddingAll: '12px', contents: [{ type: 'text', text: '📢 มีคำร้องรอฝ่ายวัดผลดำเนินการ', color: '#FFFFFF', weight: 'bold', size: 'sm' }] },
+              body: {
+                type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '12px',
+                contents: [
+                  { type: 'text', text: `👤 ${reqData.studentName}`, weight: 'bold', size: 'sm' },
+                  { type: 'text', text: `วิชา ${reqData.subjectCode} • ผู้ตรวจ: ${teacherName}`, size: 'xs', color: '#4B5563' },
+                  { type: 'text', text: `เกรดที่อนุมัติ: ${grade}`, size: 'sm', weight: 'bold', color: '#2563EB' }
+                ]
+              },
+              footer: {
+                type: 'box', layout: 'vertical', paddingAll: '10px',
+                contents: [
+                  { type: 'button', style: 'primary', color: '#2563EB', height: 'sm', action: { type: 'message', label: '🔵 ตรวจสอบงานรอวัดผล', text: 'รอวัดผล' } }
+                ]
+              }
+            });
+          }
+        } catch(aErr) { console.warn('Admin notify error:', aErr.message); }
+
         // ส่งแจ้งเตือนนักเรียน (ถ้ามี lineUserId)
         try {
           const studentDoc = await db.collection('students').doc(reqData.studentId).get();
@@ -515,6 +600,104 @@ async function handleLineEvent(event) {
       } catch (err) {
         console.error('Approve error:', err);
         await sendLineReply(event.replyToken, [{ type: 'text', text: 'เกิดข้อผิดพลาดในการอนุมัติ: ' + err.message }]);
+        return;
+      }
+    }
+
+    // C: ฝ่ายวัดผลบันทึกเสร็จสิ้นผ่านแชต (In-Chat Completion)
+    if (action === 'admin_complete') {
+      const reqId = params.get('reqId');
+      if (!db || !reqId) return;
+
+      // ตรวจสอบสิทธิ์ admin / staff
+      let isSuper = false;
+      let staffUser = null;
+      const adminDoc = await db.collection('system_config').doc('admin').get();
+      if (adminDoc.exists) {
+        const aData = adminDoc.data();
+        const aList = aData.lineUserIds || (aData.lineUserId ? [aData.lineUserId] : []);
+        if (aList.includes(userId)) isSuper = true;
+      }
+      const staffSnap = await db.collection('admin_users').where('lineUserId', '==', userId).where('isActive', '==', true).limit(1).get();
+      if (!staffSnap.empty) staffUser = staffSnap.docs[0].data();
+
+      if (!isSuper && !staffUser) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: '⚠️ ขออภัยครับ ท่านไม่มีสิทธิ์ทำรายการนี้ (สงวนสิทธิ์สำหรับฝ่ายวัดผลและแอดมิน)' }]);
+        return;
+      }
+
+      const actorName = isSuper ? 'Super Admin (ผู้ดูแลระบบ)' : (staffUser.name + ' (เจ้าหน้าที่วัดผล)');
+      const actorRole = isSuper ? 'super_admin' : 'staff';
+
+      try {
+        const reqDoc = await db.collection('requests').doc(reqId).get();
+        if (!reqDoc.exists) {
+          await sendLineReply(event.replyToken, [{ type: 'text', text: '❌ ไม่พบข้อมูลคำร้องนี้' }]);
+          return;
+        }
+        const reqData = reqDoc.data();
+        const updatedLogs = [
+          ...(reqData.auditLogs || []),
+          {
+            action: 'completed',
+            actorName: actorName,
+            actorRole: actorRole,
+            details: 'ฝ่ายวัดผลบันทึกดำเนินการแก้ไขผลการเรียนเสร็จสิ้นผ่าน LINE OA (In-Chat Completion)',
+            timestamp: new Date().toISOString()
+          }
+        ];
+
+        await db.collection('requests').doc(reqId).update({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          completedByName: actorName,
+          auditLogs: updatedLogs
+        });
+
+        // ส่งแจ้งเตือนนักเรียน
+        try {
+          const studentDoc = await db.collection('students').doc(reqData.studentId).get();
+          if (studentDoc.exists && studentDoc.data().lineUserId) {
+            await sendLineFlexMessage(
+              studentDoc.data().lineUserId,
+              `🎉 ผลการเรียนวิชา ${reqData.subjectCode} แก้ไขเสร็จสิ้นแล้ว! (เกรดใหม่: ${reqData.newGrade})`,
+              {
+                type: 'bubble', size: 'kilo',
+                header: { type: 'box', layout: 'vertical', backgroundColor: '#059669', paddingAll: '14px', contents: [{ type: 'text', text: '🎉 แก้ไขผลการเรียนสำเร็จแล้ว!', color: '#FFFFFF', weight: 'bold', size: 'md' }] },
+                body: {
+                  type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px',
+                  contents: [
+                    { type: 'text', text: `👤 ${reqData.studentName}`, weight: 'bold', size: 'sm' },
+                    { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.subjectName || '-'})`, size: 'xs', color: '#4B5563' },
+                    { type: 'text', text: `เกรดเดิม: ${reqData.gradeType} ➡️ เกรดใหม่: ${reqData.newGrade}`, size: 'sm', weight: 'bold', color: '#059669' },
+                    { type: 'separator', margin: 'sm' },
+                    { type: 'text', text: 'ฝ่ายวัดผลได้ลงบันทึกในระบบเรียบร้อยแล้วครับ', size: 'xs', color: '#6B7280' }
+                  ]
+                }
+              }
+            );
+          }
+        } catch(sErr) { console.warn('Student notify error:', sErr.message); }
+
+        await sendLineReply(event.replyToken, [{
+          type: 'flex', altText: 'บันทึกเสร็จสิ้นสำเร็จ',
+          contents: {
+            type: 'bubble', size: 'kilo',
+            header: { type: 'box', layout: 'vertical', backgroundColor: '#059669', paddingAll: '14px', contents: [{ type: 'text', text: '✅ บันทึกจบผลการเรียนเรียบร้อย!', color: '#FFFFFF', weight: 'bold', size: 'md' }] },
+            body: {
+              type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '14px',
+              contents: [
+                { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.studentName})`, weight: 'bold', size: 'sm' },
+                { type: 'text', text: `เกรดที่ได้: ${reqData.newGrade} (แก้ไขจาก ${reqData.gradeType})`, size: 'xs', color: '#059669' },
+                { type: 'text', text: `ผู้บันทึก: ${actorName}`, size: 'xs', color: '#6B7280' }
+              ]
+            }
+          }
+        }]);
+        return;
+      } catch(err) {
+        console.error('admin_complete err:', err);
+        await sendLineReply(event.replyToken, [{ type: 'text', text: 'เกิดข้อผิดพลาดในการบันทึก: ' + err.message }]);
         return;
       }
     }
@@ -768,18 +951,330 @@ async function handleLineEvent(event) {
       }
     }
 
-    // ── ตรวจสอบว่าบัญชีนี้ผูกกับใครอยู่แล้วหรือยัง ──
-    let linkedUser = null;
+    // ── ตรวจสอบว่าบัญชีนี้ผูกกับใครอยู่แล้วหรือยัง (Multi-Role Support) ──
+    let linkedTeacher = null;
+    let linkedStudent = null;
+    let linkedStaff = null;
+    let isSuperAdmin = false;
+
     if (db) {
+      // 1. ตรวจสอบครู
       const teacherMatch = await db.collection('teachers').where('lineUserId', '==', userId).limit(1).get();
       if (!teacherMatch.empty) {
-        linkedUser = { role: 'teacher', id: teacherMatch.docs[0].id, ...teacherMatch.docs[0].data() };
-      } else {
-        const studentMatch = await db.collection('students').where('lineUserId', '==', userId).limit(1).get();
-        if (!studentMatch.empty) {
-          linkedUser = { role: 'student', id: studentMatch.docs[0].id, ...studentMatch.docs[0].data() };
+        linkedTeacher = { id: teacherMatch.docs[0].id, ...teacherMatch.docs[0].data() };
+      }
+      // 2. ตรวจสอบนักเรียน
+      const studentMatch = await db.collection('students').where('lineUserId', '==', userId).limit(1).get();
+      if (!studentMatch.empty) {
+        linkedStudent = { id: studentMatch.docs[0].id, ...studentMatch.docs[0].data() };
+      }
+      // 3. ตรวจสอบเจ้าหน้าที่วัดผล
+      const staffMatch = await db.collection('admin_users').where('lineUserId', '==', userId).where('isActive', '==', true).limit(1).get();
+      if (!staffMatch.empty) {
+        linkedStaff = { id: staffMatch.docs[0].id, ...staffMatch.docs[0].data() };
+      }
+      // 4. ตรวจสอบ Super Admin
+      const adminDoc = await db.collection('system_config').doc('admin').get();
+      if (adminDoc.exists) {
+        const aData = adminDoc.data();
+        const aUsers = aData.lineUserIds || (aData.lineUserId ? [aData.lineUserId] : []);
+        if (aUsers.includes(userId)) {
+          isSuperAdmin = true;
         }
       }
+    }
+
+    const isAdminUser = isSuperAdmin || !!linkedStaff;
+    const userState = { linkedTeacher, linkedStudent, linkedStaff, isSuperAdmin, isAdminUser };
+    const linkedUser = linkedTeacher || linkedStudent || (isSuperAdmin ? { role: 'admin', name: 'Super Admin' } : (linkedStaff ? { role: 'staff', name: linkedStaff.name } : null));
+
+    // ── Command: ผูกบัญชี Super Admin ──
+    // รูปแบบ: "แอดมิน [password]" หรือ "admin [password]"
+    if (rawText.startsWith('แอดมิน') || rawText.startsWith('admin') || rawText.startsWith('ผู้ดูแลระบบ')) {
+      const pass = rawText.replace(/^(แอดมิน|admin|ผู้ดูแลระบบ)s*/i, '').trim();
+      if (!pass) {
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: "🔐 กรุณาระบุรหัสผ่าน Super Admin เช่น:\n\"แอดมิน [รหัสผ่าน]\""
+        }]);
+        return;
+      }
+      if (!db) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: 'ระบบฐานข้อมูลขัดข้อง กรุณาลองใหม่ภายหลัง' }]);
+        return;
+      }
+      const adminDoc = await db.collection('system_config').doc('admin').get();
+      const defaultHash = '6d5997a61f29e3755c163457a70ed8873b451f53ddc925a72254e330db6126ea';
+      const currentHash = adminDoc.exists && adminDoc.data()?.passwordHash ? adminDoc.data().passwordHash : defaultHash;
+      const enteredHash = crypto.createHash('sha256').update(pass).digest('hex');
+
+      if (enteredHash === currentHash) {
+        const existing = (adminDoc.exists && adminDoc.data()?.lineUserIds) || (adminDoc.exists && adminDoc.data()?.lineUserId ? [adminDoc.data().lineUserId] : []);
+        const updatedUsers = Array.from(new Set([...existing, userId]));
+        await db.collection('system_config').doc('admin').set({
+          lineUserIds: updatedUsers,
+          lineLinkedAt: new Date().toISOString()
+        }, { merge: true });
+
+        const adminFlex = {
+          type: 'bubble', size: 'mega',
+          header: {
+            type: 'box', layout: 'vertical', backgroundColor: '#BE123C', paddingAll: '16px',
+            contents: [
+              { type: 'text', text: '🛡️ ยืนยันสิทธิ์ Super Admin สำเร็จ!', color: '#FFFFFF', size: 'lg', weight: 'bold' },
+              { type: 'text', text: 'โรงเรียนอุเทนพัฒนา (UTP Smart)', color: '#FFE4E6', size: 'xs' }
+            ]
+          },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+            contents: [
+              { type: 'text', text: 'ยินดีต้อนรับผู้ดูแลระบบสูงสุด', size: 'md', weight: 'bold' },
+              { type: 'text', text: 'ท่านได้รับสิทธิ์บริหารจัดการระบบ, ตรวจสอบสถิติทั้งโรงเรียน และอนุมัติผลการเรียนผ่าน LINE OA เรียบร้อยแล้วครับ', size: 'xs', color: '#666666', wrap: true }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+            contents: [
+              { type: 'button', style: 'primary', color: '#BE123C', height: 'sm', action: { type: 'message', label: '📊 สรุปสถิติภาพรวม', text: 'สถิติ' } },
+              { type: 'button', style: 'secondary', height: 'sm', action: { type: 'message', label: '🔵 รายการรอวัดผลดำเนินการ', text: 'รอวัดผล' } },
+              { type: 'button', style: 'link', height: 'sm', action: { type: 'uri', label: '🌐 เปิด Dashboard แอดมิน (Auto-Login)', uri: generateAdminMagicLink('super') } }
+            ]
+          }
+        };
+        await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชี Super Admin สำเร็จ', contents: adminFlex }]);
+        return;
+      } else {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: '❌ รหัสผ่าน Super Admin ไม่ถูกต้อง กรุณาลองใหม่อีกครั้งครับ' }]);
+        return;
+      }
+    }
+
+    // ── Command: ผูกบัญชีเจ้าหน้าที่วัดผล ──
+    // รูปแบบ: "เจ้าหน้าที่ [username] [password]" หรือ "จนท [username] [password]"
+    if (rawText.startsWith('เจ้าหน้าที่') || rawText.startsWith('จนท') || rawText.startsWith('วัดผล')) {
+      const cleaned = rawText.replace(/^(เจ้าหน้าที่|จนท|วัดผล)s*/, '').trim();
+      const parts = cleaned.split(/\s+/);
+      const uname = parts[0] ? parts[0].toLowerCase() : '';
+      const pass = parts[1] || '';
+
+      if (!uname || !pass) {
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: "👤 กรุณาระบุ Username และรหัสผ่าน เช่น:\n\"เจ้าหน้าที่ somchai 123456\""
+        }]);
+        return;
+      }
+      if (!db) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: 'ระบบฐานข้อมูลขัดข้อง กรุณาลองใหม่ภายหลัง' }]);
+        return;
+      }
+      const snap = await db.collection('admin_users').where('username', '==', uname).where('isActive', '==', true).limit(1).get();
+      if (snap.empty) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: `❌ ไม่พบบัญชีเจ้าหน้าที่ Username "${uname}" ที่เปิดใช้งานในระบบ` }]);
+        return;
+      }
+      const staffData = snap.docs[0].data();
+      const staffId = snap.docs[0].id;
+      const enteredHash = crypto.createHash('sha256').update(pass).digest('hex');
+
+      if (enteredHash === staffData.passwordHash) {
+        await db.collection('admin_users').doc(staffId).update({
+          lineUserId: userId,
+          lineLinkedAt: new Date().toISOString()
+        });
+
+        const staffFlex = {
+          type: 'bubble', size: 'mega',
+          header: {
+            type: 'box', layout: 'vertical', backgroundColor: '#4338CA', paddingAll: '16px',
+            contents: [
+              { type: 'text', text: '👤 ยืนยันสิทธิ์เจ้าหน้าที่สำเร็จ!', color: '#FFFFFF', size: 'lg', weight: 'bold' },
+              { type: 'text', text: 'โรงเรียนอุเทนพัฒนา (UTP Smart)', color: '#E0E7FF', size: 'xs' }
+            ]
+          },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+            contents: [
+              { type: 'text', text: `ยินดีต้อนรับ ${staffData.name}`, size: 'md', weight: 'bold' },
+              { type: 'text', text: `Username: @${staffData.username} (เจ้าหน้าที่วัดผล)`, size: 'xs', color: '#666666' },
+              { type: 'text', text: 'ท่านสามารถตรวจสอบคำร้องและอนุมัติจบผลการเรียนผ่าน LINE OA ได้ทันทีครับ', size: 'xs', color: '#4338CA' }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+            contents: [
+              { type: 'button', style: 'primary', color: '#4338CA', height: 'sm', action: { type: 'message', label: '🔵 รายการรอวัดผลดำเนินการ', text: 'รอวัดผล' } },
+              { type: 'button', style: 'secondary', height: 'sm', action: { type: 'message', label: '📊 สรุปสถิติภาพรวม', text: 'สถิติ' } },
+              { type: 'button', style: 'link', height: 'sm', action: { type: 'uri', label: '🌐 เปิดระบบวัดผล (Auto-Login)', uri: generateAdminMagicLink('staff', staffId) } }
+            ]
+          }
+        };
+        await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีเจ้าหน้าที่สำเร็จ', contents: staffFlex }]);
+        return;
+      } else {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: '❌ รหัสผ่านของเจ้าหน้าที่ไม่ถูกต้อง กรุณาลองใหม่อีกครั้งครับ' }]);
+        return;
+      }
+    }
+
+    // ── Command: ดูสถิติภาพรวมโรงเรียน ──
+    if (text === 'สถิติ' || text === 'สรุป' || text === 'ภาพรวม' || text === 'รายงาน') {
+      if (!isAdminUser) {
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: '⚠️ ข้อมูลสถิติสงวนสิทธิ์สำหรับฝ่ายวัดผลและผู้ดูแลระบบเท่านั้นครับ\nกรุณาผูกบัญชีด้วยคำสั่ง "แอดมิน [รหัสผ่าน]" หรือ "เจ้าหน้าที่ [username] [รหัสผ่าน]"'
+        }]);
+        return;
+      }
+      if (!db) return;
+      const reqSnap = await db.collection('requests').get();
+      const total = reqSnap.size;
+      let pendingTeacher = 0;
+      let assignedWork = 0;
+      let teacherApproved = 0;
+      let completed = 0;
+      let rejected = 0;
+
+      reqSnap.forEach(d => {
+        const st = d.data().status;
+        if (st === 'pending' || st === 'pending_teacher') pendingTeacher++;
+        else if (st === 'assigned_work') assignedWork++;
+        else if (st === 'teacher_approved') teacherApproved++;
+        else if (st === 'completed') completed++;
+        else if (st === 'rejected') rejected++;
+      });
+      const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+      const statFlex = {
+        type: 'bubble', size: 'mega',
+        header: {
+          type: 'box', layout: 'vertical', backgroundColor: '#1E293B', paddingAll: '16px',
+          contents: [
+            { type: 'text', text: '📊 สรุปสถิติผลการเรียนดิจิทัล', color: '#FFFFFF', size: 'lg', weight: 'bold' },
+            { type: 'text', text: `โรงเรียนอุเทนพัฒนา • คำร้องทั้งหมด ${total} รายการ`, color: '#94A3B8', size: 'xs' }
+          ]
+        },
+        body: {
+          type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+          contents: [
+            {
+              type: 'box', layout: 'vertical', backgroundColor: '#F8FAFC', paddingAll: '12px', cornerRadius: 'md', spacing: 'sm',
+              contents: [
+                { type: 'box', layout: 'horizontal', contents: [{ type: 'text', text: '🟡 รอครูสั่งงาน:', size: 'sm', color: '#475569', flex: 3 }, { type: 'text', text: `${pendingTeacher} รายการ`, size: 'sm', weight: 'bold', color: '#D97706', align: 'end', flex: 2 }] },
+                { type: 'box', layout: 'horizontal', contents: [{ type: 'text', text: '🟣 รอนักเรียนส่งงาน:', size: 'sm', color: '#475569', flex: 3 }, { type: 'text', text: `${assignedWork} รายการ`, size: 'sm', weight: 'bold', color: '#7C3AED', align: 'end', flex: 2 }] },
+                { type: 'box', layout: 'horizontal', contents: [{ type: 'text', text: '🔵 รอฝ่ายวัดผลดำเนินการ:', size: 'sm', color: '#475569', flex: 3 }, { type: 'text', text: `${teacherApproved} รายการ`, size: 'sm', weight: 'bold', color: '#2563EB', align: 'end', flex: 2 }] },
+                { type: 'box', layout: 'horizontal', contents: [{ type: 'text', text: '🟢 ดำเนินการเสร็จสิ้น:', size: 'sm', color: '#475569', flex: 3 }, { type: 'text', text: `${completed} รายการ`, size: 'sm', weight: 'bold', color: '#059669', align: 'end', flex: 2 }] },
+                { type: 'box', layout: 'horizontal', contents: [{ type: 'text', text: '🔴 ปฏิเสธคำร้อง:', size: 'sm', color: '#475569', flex: 3 }, { type: 'text', text: `${rejected} รายการ`, size: 'sm', weight: 'bold', color: '#DC2626', align: 'end', flex: 2 }] }
+              ]
+            },
+            {
+              type: 'box', layout: 'vertical', backgroundColor: '#ECFDF5', paddingAll: '10px', cornerRadius: 'md',
+              contents: [
+                { type: 'text', text: `🎉 อัตราการแก้ไขสำเร็จ: ${percent}%`, size: 'sm', weight: 'bold', color: '#047857', align: 'center' }
+              ]
+            }
+          ]
+        },
+        footer: {
+          type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+          contents: [
+            ...(teacherApproved > 0 ? [{
+              type: 'button', style: 'primary', color: '#2563EB', height: 'sm',
+              action: { type: 'message', label: `🔵 จัดการงานรอวัดผล (${teacherApproved})`, text: 'รอวัดผล' }
+            }] : []),
+            {
+              type: 'button', style: 'secondary', height: 'sm',
+              action: {
+                type: 'uri',
+                label: '🌐 เข้าดู Dashboard แอดมินเต็ม',
+                uri: isSuperAdmin ? generateAdminMagicLink('super') : generateAdminMagicLink('staff', linkedStaff?.id || '')
+              }
+            }
+          ]
+        }
+      };
+      await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'สรุปสถิติภาพรวม', contents: statFlex }]);
+      return;
+    }
+
+    // ── Command: ดูคำร้องรอฝ่ายวัดผลดำเนินการ ──
+    if (text === 'รอวัดผล' || text === 'งานวัดผล' || text === 'ฝ่ายวัดผล') {
+      if (!isAdminUser) {
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: '⚠️ เมนูนี้สงวนสิทธิ์สำหรับฝ่ายวัดผลและผู้ดูแลระบบเท่านั้นครับ'
+        }]);
+        return;
+      }
+      if (!db) return;
+      const snap = await db.collection('requests').where('status', '==', 'teacher_approved').get();
+      if (snap.empty) {
+        await sendLineReply(event.replyToken, [{
+          type: 'text',
+          text: '🎉 ไม่มีคำร้องค้างของฝ่ายวัดผลในขณะนี้ครับ! (ครูยังไม่มีการส่งเกรดใหม่ที่รอลงบันทึก)'
+        }]);
+        return;
+      }
+
+      const bubbles = [];
+      let count = 0;
+      snap.forEach(doc => {
+        if (count >= 5) return;
+        const r = { id: doc.id, ...doc.data() };
+        bubbles.push({
+          type: 'bubble', size: 'kilo',
+          header: {
+            type: 'box', layout: 'vertical', backgroundColor: '#2563EB', paddingAll: '12px',
+            contents: [
+              { type: 'text', text: '🔵 รอฝ่ายวัดผลบันทึกผล', color: '#FFFFFF', weight: 'bold', size: 'sm' },
+              { type: 'text', text: `วิชา ${r.subjectCode || '-'} • เกรดเดิม ${r.gradeType || '-'}`, color: '#DBEAFE', size: 'xxs' }
+            ]
+          },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '12px',
+            contents: [
+              { type: 'text', text: `👤 ${r.studentName || '-'} (ม.${r.studentClass || '-'})`, weight: 'bold', size: 'sm' },
+              { type: 'text', text: `ครูผู้ตรวจ: ${r.teacherName || '-'}`, size: 'xs', color: '#555555' },
+              { type: 'separator', margin: 'xs' },
+              {
+                type: 'box', layout: 'horizontal', margin: 'xs',
+                contents: [
+                  { type: 'text', text: 'ผลการเรียนใหม่:', size: 'xs', color: '#666666' },
+                  { type: 'text', text: `เกรด ${r.newGrade || '-'}`, size: 'sm', weight: 'bold', color: '#059669', align: 'end' }
+                ]
+              }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '10px',
+            contents: [
+              {
+                type: 'button', style: 'primary', color: '#059669', height: 'sm',
+                action: {
+                  type: 'postback',
+                  label: '✅ บันทึกเสร็จสิ้น (จบงาน)',
+                  data: `action=admin_complete&reqId=${r.id}`
+                }
+              },
+              {
+                type: 'button', style: 'link', height: 'sm',
+                action: {
+                  type: 'uri',
+                  label: '🌐 เปิดดูในระบบ',
+                  uri: isSuperAdmin ? generateAdminMagicLink('super') : generateAdminMagicLink('staff', linkedStaff?.id || '')
+                }
+              }
+            ]
+          }
+        });
+        count++;
+      });
+
+      await sendLineReply(event.replyToken, [
+        { type: 'text', text: `📋 พบคำร้องรอฝ่ายวัดผลดำเนินการ ${snap.size} รายการ (สามารถกดปุ่ม [✅ บันทึกเสร็จสิ้น] ได้เลยที่การ์ดด้านล่างครับ):` },
+        { type: 'flex', altText: 'รายการรอฝ่ายวัดผล', contents: { type: 'carousel', contents: bubbles } }
+      ]);
+      return;
     }
 
     // A: ขอ LINE User ID
@@ -1140,7 +1635,7 @@ async function handleLineEvent(event) {
     }
 
     // G: เมนูหลัก / Help
-    const menuFlex = buildMainMenuFlex(userId, linkedUser);
+    const menuFlex = buildMainMenuFlex(userId, userState);
     await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'เมนูระบบ UTP Smart', contents: menuFlex }]);
   }
 }
