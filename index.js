@@ -888,7 +888,7 @@ async function handleLineEvent(event) {
           const inputPin = pinMatch[1] || pinMatch[0];
           const matchedTeacher = session.teacher;
 
-          if (matchedTeacher.pin === inputPin) {
+          if ((await effectiveTeacherPin(matchedTeacher.id)) === inputPin) {
             // รหัสถูกต้อง! ผูกบัญชีสำเร็จ
             pendingPinVerification.delete(userId);
 
@@ -974,16 +974,17 @@ async function handleLineEvent(event) {
           const inputPin = pinMatch[1] || pinMatch[0];
           const matchedStudent = session.student;
 
-          if (!matchedStudent.pin || matchedStudent.pin === inputPin || session.isSetup) {
+          const storedPin = await studentSecret(matchedStudent.id, 'pin');
+          if (!storedPin || storedPin === inputPin || session.isSetup) {
             pendingStudentPinVerification.delete(userId);
 
-            const updateData = {
+            await db.collection('students').doc(matchedStudent.id).update({
               lineUserId: userId,
               lineLinkedAt: new Date().toISOString()
-            };
-            if (!matchedStudent.pin || session.isSetup) updateData.pin = inputPin;
-
-            await db.collection('students').doc(matchedStudent.id).update(updateData);
+            });
+            if (!storedPin || session.isSetup) {
+              await writeSecret('student_secrets', matchedStudent.id, { pin: inputPin });
+            }
 
             const successStudentFlex = {
               type: 'bubble', size: 'kilo',
@@ -1433,7 +1434,7 @@ async function handleLineEvent(event) {
 
       // กรณีครูพิมพ์ PIN มาพร้อมกันในคำสั่งเดียว เช่น "ครู สมชาย 1234"
       if (inlinePin) {
-        if (matchedTeacher.pin === inlinePin) {
+        if ((await effectiveTeacherPin(matchedTeacher.id)) === inlinePin) {
           // ถูกต้อง! ผูกสำเร็จทันที
           await db.collection('teachers').doc(matchedTeacher.id).update({
             lineUserId: userId,
@@ -1580,16 +1581,18 @@ async function handleLineEvent(event) {
         }
       });
 
+      const knownStudentPin = await studentSecret(matchedStudent.id, 'pin');
+
       // กรณีที่ 1: นักเรียนพิมพ์ PIN มาพร้อมกันในคำสั่งเดียว เช่น "นักเรียน 12345 1234"
       if (inlinePin) {
-        if (!matchedStudent.pin || matchedStudent.pin === inlinePin) {
-          const updateData = {
+        if (!knownStudentPin || knownStudentPin === inlinePin) {
+          await db.collection('students').doc(matchedStudent.id).update({
             lineUserId: userId,
             lineLinkedAt: new Date().toISOString()
-          };
-          if (!matchedStudent.pin) updateData.pin = inlinePin;
-
-          await db.collection('students').doc(matchedStudent.id).update(updateData);
+          });
+          if (!knownStudentPin) {
+            await writeSecret('student_secrets', matchedStudent.id, { pin: inlinePin });
+          }
           await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชีนักเรียนสำเร็จ', contents: buildSuccessFlex(matchedStudent) }]);
           return;
         } else {
@@ -1602,7 +1605,7 @@ async function handleLineEvent(event) {
       }
 
       // กรณีที่ 2: นักเรียนยังไม่ได้ใส่ PIN มาด้วย -> บอทถาม PIN เพื่อความปลอดภัย (PDPA)
-      if (matchedStudent.pin) {
+      if (knownStudentPin) {
         pendingStudentPinVerification.set(userId, { student: matchedStudent, isSetup: false, timestamp: Date.now() });
         await sendLineReply(event.replyToken, [{
           type: 'text',
@@ -1952,10 +1955,20 @@ app.post('/api/request-pin-reset', async (req, res) => {
 
     let matchedUser = null;
     if (role === 'teacher') {
-      const snap = await db.collection('teachers').get();
-      snap.forEach(doc => {
+      // อีเมลอาจย้ายไป teacher_secrets แล้ว — ตรวจทั้งสองที่
+      const [tSnap, sSnap] = await Promise.all([
+        db.collection('teachers').get(),
+        db.collection('teacher_secrets').get()
+      ]);
+      const secrets = {};
+      sSnap.forEach(d => { secrets[d.id] = d.data(); });
+      const wantedEmail = String(email).trim().toLowerCase();
+
+      tSnap.forEach(doc => {
         const d = doc.data();
-        if (doc.id === identifier || d.phone === identifier || (d.email && d.email.toLowerCase() === email.toLowerCase())) {
+        const sec = secrets[doc.id] || {};
+        const mail = String(sec.email || d.email || '').toLowerCase();
+        if (doc.id === identifier || d.phone === identifier || (mail && mail === wantedEmail)) {
           matchedUser = { id: doc.id, ...d };
         }
       });
@@ -2064,9 +2077,9 @@ app.post('/api/verify-pin-reset', async (req, res) => {
       return res.status(400).json({ error: 'รหัสยืนยันนี้หมดอายุแล้ว (เกิน 15 นาที) กรุณาขอใหม่อีกครั้ง' });
     }
 
-    // อัปเดต PIN ใน Firestore
-    const targetCollection = resetDoc.role === 'teacher' ? 'teachers' : 'students';
-    await db.collection(targetCollection).doc(resetDoc.targetId).update({
+    // อัปเดต PIN ใน Firestore (เก็บใน *_secrets ที่หน้าเว็บอ่านไม่ได้)
+    const targetSecrets = resetDoc.role === 'teacher' ? 'teacher_secrets' : 'student_secrets';
+    await writeSecret(targetSecrets, resetDoc.targetId, {
       pin: newPin,
       pinUpdatedAt: new Date().toISOString()
     });
@@ -2095,6 +2108,487 @@ app.post('/api/verify-pin-reset', async (req, res) => {
     });
   } catch (err) {
     console.error('verify-pin-reset error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  AUTH API — ตรวจ PIN / รหัสผ่านทั้งหมดที่ฝั่งเซิร์ฟเวอร์เท่านั้น
+//  หน้าเว็บไม่อ่าน PIN เองอีกต่อไป และได้ Firebase custom token กลับไป
+//  เพื่อให้ firestore.rules บังคับสิทธิ์ได้จริง
+// ═══════════════════════════════════════════════════════════════════
+
+// PIN ตั้งต้นของคุณครู — ใช้เข้าระบบครั้งแรกได้ทันทีโดยไม่ต้องตั้งค่า
+// และเปลี่ยนเป็นรหัสส่วนตัวได้ทุกเมื่อจากเมนู "PIN" ในห้องทำงานครู
+const DEFAULT_TEACHER_PIN = process.env.DEFAULT_TEACHER_PIN || '2026';
+
+// อ่านความลับจาก *_secrets ก่อน ถ้ายังไม่มีค่อย fallback ไปเอกสารเดิม
+// (รองรับช่วงทยอย migrate โดยระบบไม่ล่ม)
+async function readSecret(secretCol, legacyCol, id, field) {
+  if (!db || !id) return undefined;
+  const s = await db.collection(secretCol).doc(String(id)).get();
+  if (s.exists && s.data()[field] !== undefined && s.data()[field] !== '') {
+    return s.data()[field];
+  }
+  const l = await db.collection(legacyCol).doc(String(id)).get();
+  if (l.exists && l.data()[field] !== undefined && l.data()[field] !== '') {
+    return l.data()[field];
+  }
+  return undefined;
+}
+
+async function writeSecret(secretCol, id, patch) {
+  await db.collection(secretCol).doc(String(id)).set(
+    { ...patch, updatedAt: new Date().toISOString() },
+    { merge: true }
+  );
+}
+
+const teacherSecret = (id, field) => readSecret('teacher_secrets', 'teachers', id, field);
+const studentSecret = (id, field) => readSecret('student_secrets', 'students', id, field);
+
+// PIN ครูที่ใช้ได้จริง ณ ตอนนี้ — ถ้ายังไม่เคยตั้ง ให้ถือว่าเป็น PIN ตั้งต้น
+async function effectiveTeacherPin(id) {
+  const stored = await teacherSecret(id, 'pin');
+  return stored || DEFAULT_TEACHER_PIN;
+}
+
+// สร้าง Firebase custom token พร้อม claims ให้ rules ใช้ตัดสินสิทธิ์
+async function mintToken(uid, claims) {
+  return admin.auth().createCustomToken(uid, claims);
+}
+
+const isPin = (v) => typeof v === 'string' && /^\d{4}$/.test(v);
+const sha256hex = (s) => crypto.createHash('sha256').update(s).digest('hex');
+
+// กันเดา PIN แบบสุ่ม — จำกัดจำนวนครั้งต่อ identifier
+const failCounts = new Map();
+const MAX_FAILS = 8;
+const FAIL_WINDOW_MS = 10 * 60 * 1000;
+
+function tooManyFails(key) {
+  const rec = failCounts.get(key);
+  if (!rec) return false;
+  if (Date.now() - rec.first > FAIL_WINDOW_MS) { failCounts.delete(key); return false; }
+  return rec.count >= MAX_FAILS;
+}
+function noteFail(key) {
+  const rec = failCounts.get(key);
+  if (!rec || Date.now() - rec.first > FAIL_WINDOW_MS) {
+    failCounts.set(key, { count: 1, first: Date.now() });
+  } else {
+    rec.count++;
+  }
+}
+const clearFails = (key) => failCounts.delete(key);
+
+const LOCKED_MSG = 'กรอกผิดหลายครั้งเกินไป กรุณารอ 10 นาทีแล้วลองใหม่';
+
+// บันทึกลงฟีดกิจกรรมของแอดมิน — ผู้ที่ยังไม่ล็อกอินเขียน system_logs เองไม่ได้แล้ว
+// จึงต้องให้เซิร์ฟเวอร์เป็นคนบันทึกเหตุการณ์ล็อกอินล้มเหลวแทน
+async function logServer(type, title, details = '', meta = {}) {
+  try {
+    if (!db) return;
+    await db.collection('system_logs').add({
+      type, title, details, meta,
+      source: 'server',
+      timestamp: new Date().toISOString()
+    });
+  } catch (e) {
+    console.warn('logServer:', e.message);
+  }
+}
+
+// ── นักเรียน: เข้าสู่ระบบ ─────────────────────────────────────────
+app.post('/api/auth/student', async (req, res) => {
+  try {
+    const { studentId, pin } = req.body || {};
+    const id = String(studentId || '').trim();
+    if (!/^\d{5}$/.test(id) || !isPin(pin)) {
+      return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
+    }
+    const key = 'stu:' + id;
+    if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+
+    const doc = await db.collection('students').doc(id).get();
+    if (!doc.exists) return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในระบบ', notFound: true });
+
+    const stored = await studentSecret(id, 'pin');
+    if (!stored) return res.status(409).json({ error: 'ยังไม่ได้ตั้ง PIN', needsPin: true });
+    if (stored !== pin) {
+      noteFail(key);
+      logServer('login_fail', 'นักเรียนกรอก PIN ผิด', 'รหัสนักเรียน ' + id + ' (' + (doc.data().name || '-') + ')', { studentId: id });
+      return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
+    }
+    clearFails(key);
+
+    const data = doc.data();
+    const token = await mintToken('stu_' + id, { role: 'student', sid: id });
+    res.json({
+      ok: true,
+      token,
+      student: {
+        id,
+        name: data.name || '',
+        studentClass: data.studentClass || data.class || '',
+        studentNo: data.studentNo || ''
+      }
+    });
+  } catch (err) {
+    console.error('auth/student:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── นักเรียน: ลงทะเบียนครั้งแรก + ตั้ง PIN ────────────────────────
+app.post('/api/auth/student-register', async (req, res) => {
+  try {
+    const { studentId, pin, name, studentClass, studentNo } = req.body || {};
+    const id = String(studentId || '').trim();
+    if (!/^\d{5}$/.test(id) || !isPin(pin) || !String(name || '').trim()) {
+      return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
+    }
+    // ถ้ามี PIN อยู่แล้ว ห้ามตั้งทับ — ต้องไปทางรีเซ็ตเท่านั้น
+    const existing = await studentSecret(id, 'pin');
+    if (existing) {
+      return res.status(409).json({ error: 'รหัสนี้มี PIN แล้ว กรุณาเข้าสู่ระบบ หรือใช้เมนูลืม PIN' });
+    }
+
+    const clean = {
+      id,
+      name: String(name).trim(),
+      studentClass: String(studentClass || '').trim(),
+      studentNo: String(studentNo || '').trim()
+    };
+    await db.collection('students').doc(id).set(
+      { ...clean, createdAt: new Date().toISOString() },
+      { merge: true }
+    );
+    await writeSecret('student_secrets', id, { pin });
+
+    const token = await mintToken('stu_' + id, { role: 'student', sid: id });
+    res.json({ ok: true, token, student: clean });
+  } catch (err) {
+    console.error('auth/student-register:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ครู: ค้นหาจากเบอร์โทร (ไม่คืน PIN) ────────────────────────────
+app.post('/api/auth/teacher-lookup', async (req, res) => {
+  try {
+    const phone = String(req.body?.phone || '').replace(/\D/g, '');
+    if (!phone) return res.status(400).json({ error: 'กรุณากรอกเบอร์โทรศัพท์' });
+
+    const snap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
+    if (snap.empty) {
+      return res.status(404).json({ error: 'ไม่พบเบอร์โทรนี้ในระบบ กรุณาติดต่อฝ่ายวัดผลเพื่อเปิดสิทธิ์' });
+    }
+    const tDoc = snap.docs[0];
+    const teacherId = tDoc.id;
+
+    // ครูเข้าได้เสมอ — ยังไม่เคยตั้ง PIN ก็ใช้ PIN ตั้งต้นได้เลย
+    const stored = await teacherSecret(teacherId, 'pin');
+    res.json({
+      ok: true,
+      usingDefaultPin: !stored || stored === DEFAULT_TEACHER_PIN,
+      teacher: { id: teacherId, name: tDoc.data().name || '', department: tDoc.data().department || '' }
+    });
+  } catch (err) {
+    console.error('auth/teacher-lookup:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ครู: เข้าสู่ระบบด้วย PIN (รับ PIN ตั้งต้นได้ถ้ายังไม่เคยเปลี่ยน) ──
+app.post('/api/auth/teacher', async (req, res) => {
+  try {
+    const { teacherId, pin } = req.body || {};
+    const id = String(teacherId || '').trim();
+    if (!id || !isPin(pin)) return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
+
+    const key = 'tch:' + id;
+    if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+
+    const tDoc = await db.collection('teachers').doc(id).get();
+    if (!tDoc.exists) return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครู' });
+
+    const stored = await teacherSecret(id, 'pin');
+    const expected = stored || DEFAULT_TEACHER_PIN;
+    if (expected !== pin) {
+      noteFail(key);
+      logServer('login_fail', 'ครูกรอก PIN ผิด', (tDoc.data().name || id), { teacherId: id });
+      return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
+    }
+    clearFails(key);
+
+    // ครูที่ยังไม่เคยมีระเบียน PIN — บันทึกค่าตั้งต้นไว้ให้เป็นหลักฐาน
+    if (!stored) await writeSecret('teacher_secrets', id, { pin: DEFAULT_TEACHER_PIN });
+
+    const token = await mintToken('tch_' + id, { role: 'teacher', tid: id });
+    res.json({
+      ok: true,
+      token,
+      usingDefaultPin: pin === DEFAULT_TEACHER_PIN,
+      teacher: { id, name: tDoc.data().name || '', department: tDoc.data().department || '' }
+    });
+  } catch (err) {
+    console.error('auth/teacher:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ครู: เปลี่ยน PIN ──────────────────────────────────────────────
+app.post('/api/auth/teacher-change-pin', async (req, res) => {
+  try {
+    const { teacherId, currentPin, newPin } = req.body || {};
+    const id = String(teacherId || '').trim();
+    if (!id || !isPin(currentPin) || !isPin(newPin)) {
+      return res.status(400).json({ error: 'กรุณากรอก PIN 4 หลักให้ครบถ้วน' });
+    }
+    const key = 'tch:' + id;
+    if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+
+    const expected = await effectiveTeacherPin(id);
+    if (expected !== currentPin) {
+      noteFail(key);
+      return res.status(401).json({ error: 'PIN ปัจจุบันไม่ถูกต้อง' });
+    }
+    clearFails(key);
+    await writeSecret('teacher_secrets', id, { pin: newPin });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('auth/teacher-change-pin:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ครู: เปิดคำร้องจาก QR/ลิงก์ แล้วยืนยันด้วย PIN ─────────────────
+//   คืนทั้ง token และตัวคำร้อง เพราะหน้าเว็บยังอ่าน requests ไม่ได้จนกว่าจะ login
+app.post('/api/auth/teacher-by-qr', async (req, res) => {
+  try {
+    const { qrToken, pin } = req.body || {};
+    const tok = String(qrToken || '').trim().toUpperCase().replace('REQ-', '');
+    if (!tok || !isPin(pin)) return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
+
+    const snap = await db.collection('requests').where('qrToken', '==', tok).limit(1).get();
+    if (snap.empty) return res.status(404).json({ error: 'ไม่พบคำร้องนี้' });
+
+    const reqData = snap.docs[0].data();
+    const id = reqData.teacherId;
+    const key = 'tch:' + id;
+    if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+
+    const expected = await effectiveTeacherPin(id);
+    if (expected !== pin) {
+      noteFail(key);
+      return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
+    }
+    clearFails(key);
+
+    const tDoc = await db.collection('teachers').doc(id).get();
+    const token = await mintToken('tch_' + id, { role: 'teacher', tid: id });
+    res.json({
+      ok: true,
+      token,
+      teacher: {
+        id,
+        name: tDoc.exists ? tDoc.data().name || '' : reqData.teacherName || '',
+        department: tDoc.exists ? tDoc.data().department || '' : ''
+      },
+      request: reqData
+    });
+  } catch (err) {
+    console.error('auth/teacher-by-qr:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Magic Link: ตรวจลายเซ็นที่เซิร์ฟเวอร์ (secret ไม่อยู่ในหน้าเว็บแล้ว) ──
+app.post('/api/auth/magic', async (req, res) => {
+  try {
+    const { tid, t, sig, req: reqId } = req.body || {};
+    if (!tid || !t || !sig) return res.status(400).json({ error: 'ลิงก์ไม่สมบูรณ์' });
+
+    const elapsed = Date.now() - parseInt(t, 10);
+    if (isNaN(elapsed) || elapsed < 0 || elapsed > 7 * 24 * 60 * 60 * 1000) {
+      return res.status(401).json({ error: 'ลิงก์หมดอายุแล้ว กรุณาเข้าสู่ระบบด้วย PIN' });
+    }
+    const expected = sha256hex(`${WEBHOOK_SECRET}:${tid}:${t}:${reqId || ''}`);
+    if (expected !== sig) return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
+
+    const tDoc = await db.collection('teachers').doc(String(tid)).get();
+    if (!tDoc.exists) return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครู' });
+
+    const token = await mintToken('tch_' + tid, { role: 'teacher', tid: String(tid) });
+    res.json({
+      ok: true,
+      token,
+      teacher: { id: String(tid), name: tDoc.data().name || '', department: tDoc.data().department || '' }
+    });
+  } catch (err) {
+    console.error('auth/magic:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Magic Link ฝั่งแอดมิน ─────────────────────────────────────────
+app.post('/api/auth/admin-magic', async (req, res) => {
+  try {
+    const { aid, at, sig } = req.body || {};
+    if (!aid || !at || !sig) return res.status(400).json({ error: 'ลิงก์ไม่สมบูรณ์' });
+
+    const elapsed = Date.now() - parseInt(at, 10);
+    if (isNaN(elapsed) || elapsed < 0 || elapsed > 7 * 24 * 60 * 60 * 1000) {
+      return res.status(401).json({ error: 'ลิงก์หมดอายุแล้ว' });
+    }
+    if (sha256hex(`${WEBHOOK_SECRET}:${aid}:${at}`) !== sig) {
+      logServer('security_warn', 'ลายเซ็น Magic Link แอดมินไม่ถูกต้อง', 'พยายามเข้าระบบด้วยลิงก์ที่ลายเซ็นไม่ตรง (aid=' + aid + ')', { aid });
+      return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
+    }
+
+    if (aid === 'super') {
+      const token = await mintToken('adm_super', { role: 'admin', aid: 'super' });
+      return res.json({ ok: true, token, role: 'super' });
+    }
+    const staff = await db.collection('admin_users').doc(String(aid)).get();
+    if (!staff.exists || !staff.data().isActive) {
+      return res.status(403).json({ error: 'บัญชีเจ้าหน้าที่ถูกปิดใช้งาน' });
+    }
+    const token = await mintToken('adm_' + aid, { role: 'staff', aid: String(aid) });
+    res.json({
+      ok: true, token, role: 'sub',
+      staff: { id: staff.data().id, name: staff.data().name, username: staff.data().username }
+    });
+  } catch (err) {
+    console.error('auth/admin-magic:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Super Admin: เข้าสู่ระบบ ──────────────────────────────────────
+app.post('/api/auth/admin', async (req, res) => {
+  try {
+    const password = String(req.body?.password || '').trim();
+    if (!password) return res.status(400).json({ error: 'กรุณากรอกรหัสผ่าน' });
+    if (tooManyFails('adm:super')) return res.status(429).json({ error: LOCKED_MSG });
+
+    const sec = await db.collection('admin_secrets').doc('super').get();
+    let stored = sec.exists ? sec.data().passwordHash : '';
+    if (!stored) {
+      const cfg = await db.collection('system_config').doc('admin').get();
+      stored = cfg.exists ? cfg.data().passwordHash || '' : '';
+    }
+    if (!stored) {
+      return res.status(503).json({ error: 'ยังไม่ได้ตั้งรหัสผ่าน Super Admin กรุณาติดต่อผู้ดูแลระบบ' });
+    }
+    if (sha256hex(password) !== stored) {
+      noteFail('adm:super');
+      logServer('security_warn', 'พยายามเข้า Super Admin ด้วยรหัสผิด', 'มีการกรอกรหัสผ่าน Super Admin ไม่ถูกต้อง');
+      return res.status(401).json({ error: 'รหัสผ่านไม่ถูกต้อง' });
+    }
+    clearFails('adm:super');
+
+    const token = await mintToken('adm_super', { role: 'admin', aid: 'super' });
+    res.json({ ok: true, token, role: 'super' });
+  } catch (err) {
+    console.error('auth/admin:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── เจ้าหน้าที่วัดผล: เข้าสู่ระบบ ──────────────────────────────────
+app.post('/api/auth/staff', async (req, res) => {
+  try {
+    const username = String(req.body?.username || '').trim().toLowerCase();
+    const password = String(req.body?.password || '').trim();
+    if (!username || !password) return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
+    if (tooManyFails('stf:' + username)) return res.status(429).json({ error: LOCKED_MSG });
+
+    const snap = await db.collection('admin_users').where('username', '==', username).limit(1).get();
+    if (snap.empty) {
+      noteFail('stf:' + username);
+      return res.status(401).json({ error: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' });
+    }
+    const staffId = snap.docs[0].id;
+    const staff = snap.docs[0].data();
+    if (!staff.isActive) return res.status(403).json({ error: 'บัญชีนี้ถูกปิดใช้งาน กรุณาติดต่อ Super Admin' });
+
+    const stored = await readSecret('admin_secrets', 'admin_users', staffId, 'passwordHash');
+    if (!stored || sha256hex(password) !== stored) {
+      noteFail('stf:' + username);
+      logServer('login_fail', 'เจ้าหน้าที่กรอกรหัสผ่านผิด', (staff.name || '-') + ' (@' + username + ')', { username, userId: staffId });
+      return res.status(401).json({ error: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' });
+    }
+    clearFails('stf:' + username);
+
+    const token = await mintToken('adm_' + staffId, { role: 'staff', aid: staffId });
+    res.json({ ok: true, token, role: 'sub', staff: { id: staff.id, name: staff.name, username: staff.username } });
+  } catch (err) {
+    console.error('auth/staff:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── แอดมิน/เจ้าหน้าที่: เปลี่ยนรหัสผ่านตนเอง ───────────────────────
+app.post('/api/auth/admin-change-password', async (req, res) => {
+  try {
+    const { aid, currentPassword, newPassword } = req.body || {};
+    const id = String(aid || '').trim();
+    const curr = String(currentPassword || '').trim();
+    const next = String(newPassword || '').trim();
+    if (!id || !curr || next.length < 8) {
+      return res.status(400).json({ error: 'รหัสผ่านใหม่ต้องยาวอย่างน้อย 8 ตัวอักษร' });
+    }
+    if (tooManyFails('pwd:' + id)) return res.status(429).json({ error: LOCKED_MSG });
+
+    // ทั้ง Super Admin และเจ้าหน้าที่ใช้ชื่อฟิลด์ passwordHash เหมือนกัน
+    const isSuper = id === 'super';
+    const field = 'passwordHash';
+    const stored = await readSecret(
+      'admin_secrets',
+      isSuper ? 'system_config' : 'admin_users',
+      isSuper ? 'admin' : id,
+      field
+    );
+    if (!stored || sha256hex(curr) !== stored) {
+      noteFail('pwd:' + id);
+      return res.status(401).json({ error: 'รหัสผ่านปัจจุบันไม่ถูกต้อง' });
+    }
+    clearFails('pwd:' + id);
+
+    await writeSecret('admin_secrets', id, { [field]: sha256hex(next) });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('auth/admin-change-password:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ครู: รีเซ็ต PIN นักเรียน (ยืนยันด้วย PIN ครูเอง) ────────────────
+app.post('/api/auth/reset-student-pin', async (req, res) => {
+  try {
+    const { teacherId, teacherPin, studentId } = req.body || {};
+    const tid = String(teacherId || '').trim();
+    const sid = String(studentId || '').trim();
+    if (!tid || !isPin(teacherPin) || !sid) return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
+
+    const key = 'tch:' + tid;
+    if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+    const expected = await effectiveTeacherPin(tid);
+    if (expected !== teacherPin) {
+      noteFail(key);
+      return res.status(401).json({ error: 'PIN คุณครูไม่ถูกต้อง' });
+    }
+    clearFails(key);
+
+    const del = admin.firestore.FieldValue.delete();
+    await db.collection('student_secrets').doc(sid).set({ pin: del }, { merge: true });
+    await db.collection('students').doc(sid).set({ pin: del }, { merge: true });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('auth/reset-student-pin:', err);
     res.status(500).json({ error: err.message });
   }
 });
