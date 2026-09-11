@@ -162,9 +162,9 @@ function buildTeacherFlex(req, magicUrl) {
       type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
       action: {
         type: 'postback',
-        label: '⭐ อนุมัติเกรด 1 ทันที',
-        data: `action=approve&reqId=${req.id}&grade=1`,
-        displayText: `อนุมัติเกรด 1 วิชา ${req.subjectCode}`
+        label: '⭐ ให้ผ่าน (เกรด 1)',
+        data: `action=approve_confirm&reqId=${req.id}&grade=1`,
+        displayText: 'เลือกให้ผ่าน เกรด 1'
       }
     });
   } else {
@@ -178,8 +178,8 @@ function buildTeacherFlex(req, magicUrl) {
         action: {
           type: 'postback',
           label: String(g),
-          data: `action=approve&reqId=${req.id}&grade=${g}`,
-          displayText: `อนุมัติเกรด ${g} วิชา ${req.subjectCode || ''}`.trim()
+          data: `action=approve_confirm&reqId=${req.id}&grade=${g}`,
+          displayText: `เลือกเกรด ${g}`
         }
       }))
     });
@@ -274,6 +274,10 @@ function buildStudentFlex(req) {
         { type: 'text', text: 'สถานะ: ' + s.label, size: 'sm', weight: 'bold', color: s.color, wrap: true },
         ...(req.newGrade ? [{ type: 'text', text: 'เกรดใหม่: ' + req.newGrade, size: 'sm', weight: 'bold', color: '#0B6623' }] : []),
         ...(req.assignmentDetails ? [{ type: 'text', text: 'งานที่ได้รับมอบหมาย: ' + req.assignmentDetails, size: 'xs', color: '#7B1FA2', wrap: true }] : []),
+        ...(extractUrl(req.assignmentLink) ? [{
+          type: 'button', style: 'primary', color: '#7B1FA2', height: 'sm', margin: 'md',
+          action: { type: 'uri', label: '🔗 เปิดลิงก์งาน', uri: extractUrl(req.assignmentLink) }
+        }] : []),
         ...(req.adminNote ? [{ type: 'text', text: 'หมายเหตุ: ' + req.adminNote, size: 'xs', color: '#666666', wrap: true }] : []),
       ],
     },
@@ -479,9 +483,82 @@ async function handleLineEvent(event) {
     logEvent('POSTBACK_ACTION', { action, data: postbackData });
 
     // A: ครูอนุมัติเกรดผ่านแชต
+    // ── ขั้นยืนยัน: แตะเกรดแล้วยังไม่บันทึก ต้องกดยืนยันอีกครั้ง ──
+    if (action === 'approve_confirm') {
+      const reqId = params.get('reqId');
+      const grade = params.get('grade');
+      if (!db) return;
+
+      const reqDoc = await db.collection('requests').doc(reqId).get();
+      if (!reqDoc.exists) {
+        await sendLineReply(event.replyToken, [{ type: 'text', text: '❌ ไม่พบคำร้องนี้' }]);
+        return;
+      }
+      const r = reqDoc.data();
+
+      // อนุมัติไปแล้ว — ไม่ให้กดซ้ำเงียบๆ ต้องเลือกว่าจะแก้จริงไหม
+      if (r.status === 'teacher_approved' || r.status === 'completed') {
+        const locked = r.status === 'completed';
+        await sendLineReply(event.replyToken, [{
+          type: 'flex',
+          altText: 'คำร้องนี้อนุมัติไปแล้ว',
+          contents: {
+            type: 'bubble', size: 'kilo',
+            header: { type: 'box', layout: 'vertical', backgroundColor: locked ? '#6B7280' : '#B45309', paddingAll: '12px',
+              contents: [{ type: 'text', text: locked ? '🔒 ฝ่ายวัดผลบันทึกแล้ว' : '✓ อนุมัติไปแล้ว', color: '#FFFFFF', weight: 'bold', size: 'sm' }] },
+            body: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px', contents: [
+              { type: 'text', text: `${r.studentName || '-'} · ${r.subjectCode || '-'}`, size: 'sm', weight: 'bold', wrap: true },
+              { type: 'text', text: `เกรดที่อนุมัติไว้: ${r.newGrade || '-'}`, size: 'md', weight: 'bold', color: '#16A34A' },
+              { type: 'text',
+                text: locked
+                  ? 'ฝ่ายวัดผลบันทึกลง SGS แล้ว หากต้องแก้จริง กรุณาติดต่อฝ่ายวัดผลโดยตรงครับ'
+                  : `หากต้องการเปลี่ยนเป็นเกรด ${grade} จริง กดปุ่มด้านล่าง ระบบจะแจ้งฝ่ายวัดผลให้ทราบ`,
+                size: 'xs', color: '#6B7280', wrap: true }
+            ]},
+            footer: locked ? undefined : { type: 'box', layout: 'vertical', paddingAll: '10px', contents: [
+              { type: 'button', style: 'primary', color: '#B45309', height: 'sm',
+                action: { type: 'postback', label: `เปลี่ยนเป็นเกรด ${grade}`, data: `action=approve&reqId=${reqId}&grade=${grade}&change=1`, displayText: `ขอเปลี่ยนเป็นเกรด ${grade}` } }
+            ]}
+          }
+        }]);
+        return;
+      }
+
+      await sendLineReply(event.replyToken, [{
+        type: 'flex',
+        altText: `ยืนยันให้เกรด ${grade}`,
+        contents: {
+          type: 'bubble', size: 'kilo',
+          header: { type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '12px',
+            contents: [{ type: 'text', text: 'ยืนยันการให้เกรด', color: '#FFFFFF', weight: 'bold', size: 'sm' }] },
+          body: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px', contents: [
+            { type: 'text', text: r.studentName || '-', size: 'sm', weight: 'bold', wrap: true },
+            { type: 'text', text: `รหัส ${r.studentId || '-'} · วิชา ${r.subjectCode || '-'}`, size: 'xs', color: '#2563EB', wrap: true },
+            { type: 'text', text: `ปีการศึกษา ${academicYear(r.semester)} ภาคเรียน ${termOf(r.semester)}`, size: 'xs', color: '#4B5563' },
+            { type: 'separator', margin: 'sm' },
+            { type: 'text', text: `${r.gradeType || '-'}  →  ${grade}`, size: 'xl', weight: 'bold', color: '#0B6623', align: 'center', margin: 'md' },
+            { type: 'text', text: 'กดยืนยันแล้วจะส่งต่อฝ่ายวัดผลทันที', size: 'xs', color: '#6B7280', align: 'center', wrap: true }
+          ]},
+          footer: { type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '10px', contents: [
+            { type: 'button', style: 'secondary', height: 'sm', flex: 1,
+              action: { type: 'postback', label: 'ยกเลิก', data: 'action=noop', displayText: 'ยกเลิก' } },
+            { type: 'button', style: 'primary', color: '#0B6623', height: 'sm', flex: 2,
+              action: { type: 'postback', label: `ยืนยันเกรด ${grade}`, data: `action=approve&reqId=${reqId}&grade=${grade}`, displayText: `ยืนยันเกรด ${grade}` } }
+          ]}
+        }
+      }]);
+      return;
+    }
+
+    if (action === 'noop') {
+      await sendLineReply(event.replyToken, [{ type: 'text', text: 'ยกเลิกแล้วครับ ยังไม่มีการบันทึกใดๆ' }]);
+      return;
+    }
+
     if (action === 'approve') {
       const reqId = params.get('reqId');
       const grade = params.get('grade');
+      const isChange = params.get('change') === '1';
 
       if (!db) {
         await sendLineReply(event.replyToken, [{ type: 'text', text: 'ระบบฐานข้อมูลขัดข้อง กรุณาลองใหม่ภายหลัง' }]);
@@ -516,14 +593,45 @@ async function handleLineEvent(event) {
           return;
         }
 
+        // ฝ่ายวัดผลบันทึกลง SGS แล้ว ห้ามแก้ผ่านแชต
+        if (reqData.status === 'completed') {
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: `🔒 คำร้องนี้ฝ่ายวัดผลบันทึกลง SGS แล้ว (เกรด ${reqData.newGrade || '-'})\nหากต้องแก้ กรุณาติดต่อฝ่ายวัดผลโดยตรงครับ`
+          }]);
+          return;
+        }
+
+        // กดยืนยันซ้ำด้วยเกรดเดิม — ไม่บันทึกซ้ำ ไม่แจ้งซ้ำ
+        if (reqData.status === 'teacher_approved' && String(reqData.newGrade) === String(grade)) {
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: `✓ คำร้องนี้อนุมัติเกรด ${grade} ไว้แล้วครับ ไม่ต้องกดซ้ำ\nระบบส่งต่อให้ฝ่ายวัดผลเรียบร้อยแล้ว`
+          }]);
+          return;
+        }
+
+        // จะเปลี่ยนเกรดที่อนุมัติไปแล้ว ต้องมากจากปุ่ม "เปลี่ยนเป็นเกรด..." เท่านั้น
+        const wasApproved = reqData.status === 'teacher_approved';
+        if (wasApproved && !isChange) {
+          await sendLineReply(event.replyToken, [{
+            type: 'text',
+            text: `คำร้องนี้อนุมัติเกรด ${reqData.newGrade} ไว้แล้ว\nหากต้องการเปลี่ยน กรุณาแตะเกรดที่ต้องการอีกครั้งแล้วยืนยันครับ`
+          }]);
+          return;
+        }
+
         const teacherName = teacherDoc.data().name || teacherDoc.data().teacherName || 'คุณครู';
+        const prevGrade = reqData.newGrade;
         const updatedLogs = [
           ...(reqData.auditLogs || []),
           {
-            action: 'teacher_approved',
+            action: wasApproved ? 'grade_changed' : 'teacher_approved',
             actorName: teacherName,
             actorRole: 'teacher',
-            details: `อนุมัติผลการเรียนใหม่เป็นเกรด "${grade}" ผ่าน LINE OA (In-Chat Approval)`,
+            details: wasApproved
+              ? `แก้เกรดที่อนุมัติแล้วจาก "${prevGrade}" เป็น "${grade}" ผ่าน LINE OA`
+              : `อนุมัติผลการเรียนใหม่เป็นเกรด "${grade}" ผ่าน LINE OA (In-Chat Approval)`,
             timestamp: new Date().toISOString()
           }
         ];
@@ -537,37 +645,16 @@ async function handleLineEvent(event) {
           auditLogs: updatedLogs
         });
 
-        // แจ้งเตือนฝ่ายวัดผลและผู้ดูแลระบบว่ามีเกรดรอลงทะเบียน
+        // แจ้งฝ่ายวัดผล: ปกติส่งเป็น "สรุปรวบยอด" ไม่ยิงทีละคน
+        // ถ้ามีนักเรียนแก้เกรดเป็นร้อย ฝ่ายวัดผลจะได้ข้อความเดียวต่อรอบ
+        // ยกเว้นการแก้เกรดที่อนุมัติไปแล้ว ซึ่งต้องรู้ทันที
         try {
-          const adminDoc = await db.collection('system_config').doc('admin').get();
-          const adminUsers = (adminDoc.exists && adminDoc.data()?.lineUserIds) || (adminDoc.exists && adminDoc.data()?.lineUserId ? [adminDoc.data().lineUserId] : []);
-          const staffSnap = await db.collection('admin_users').where('isActive', '==', true).get();
-          const staffUsers = [];
-          staffSnap.forEach(d => { if (d.data().lineUserId) staffUsers.push(d.data().lineUserId); });
-          const allStaff = Array.from(new Set([...adminUsers, ...staffUsers]));
-          for (const sId of allStaff) {
-            if (sId === userId) continue;
-            await sendLineFlexMessage(sId, `📢 ฝ่ายวัดผล: ครู ${teacherName} อนุมัติเกรด ${reqData.subjectCode} (${reqData.studentName}) แล้ว!`, {
-              type: 'bubble', size: 'kilo',
-              header: { type: 'box', layout: 'vertical', backgroundColor: '#2563EB', paddingAll: '12px', contents: [{ type: 'text', text: '📢 มีคำร้องรอฝ่ายวัดผลดำเนินการ', color: '#FFFFFF', weight: 'bold', size: 'sm' }] },
-              body: {
-                type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '12px',
-                contents: [
-                  { type: 'text', text: `👤 ${reqData.studentName}`, weight: 'bold', size: 'sm' },
-                  { type: 'text', text: `🆔 รหัส: ${reqData.studentId || '-'} • ชั้น ม.${reqData.studentClass || '-'}`, size: 'xs', color: '#2563EB', weight: 'bold' },
-                  { type: 'text', text: `วิชา ${reqData.subjectCode} • ผู้ตรวจ: ${teacherName}`, size: 'xs', color: '#4B5563' },
-                  { type: 'text', text: `เกรดที่อนุมัติ: ${grade}`, size: 'sm', weight: 'bold', color: '#2563EB' }
-                ]
-              },
-              footer: {
-                type: 'box', layout: 'vertical', paddingAll: '10px',
-                contents: [
-                  { type: 'button', style: 'primary', color: '#2563EB', height: 'sm', action: { type: 'message', label: '🔵 ตรวจสอบงานรอวัดผล', text: 'รอวัดผล' } }
-                ]
-              }
-            });
+          if (wasApproved) {
+            await notifyStaffGradeChanged(reqData, prevGrade, grade, teacherName);
+          } else {
+            await notifyStaffDigest();
           }
-        } catch(aErr) { console.warn('Admin notify error:', aErr.message); }
+        } catch (aErr) { console.warn('Staff notify error:', aErr.message); }
 
         // ส่งแจ้งเตือนนักเรียน (ถ้ามี lineUserId)
         try {
@@ -821,7 +908,7 @@ async function handleLineEvent(event) {
 
       await sendLineReply(event.replyToken, [{
         type: 'text',
-        text: `📝 สั่งงานนักเรียน\nวิชา: ${reqData.subjectCode} (${reqData.studentName})\n\nกรุณาพิมพ์รายละเอียดงานที่ต้องการมอบหมายในช่องแชตนี้ได้เลยครับ เช่น:\n"งาน: ให้ทำแบบฝึกหัดบทที่ 3 ข้อ 1-10 ส่งภายในวันศุกร์นี้"`
+        text: `📝 สั่งงานนักเรียน\nวิชา: ${reqData.subjectCode} (${reqData.studentName})\n\nพิมพ์รายละเอียดงานในช่องแชตนี้ได้เลยครับ เช่น:\n"งาน: ทำแบบฝึกหัดบทที่ 3 ข้อ 1-10 ส่งภายในวันศุกร์"\n\n🔗 แนบลิงก์ได้ด้วย เพียงวาง URL ต่อท้ายข้อความ ระบบจะทำเป็นปุ่มให้นักเรียนกดเปิด`
       }]);
       return;
     }
@@ -841,6 +928,7 @@ async function handleLineEvent(event) {
           const reqId = session.reqId;
           const reqData = session.reqData;
           const assignmentDetails = rawText.replace(/^งาน\s*:\s*/i, '').trim();
+          const assignmentLink = extractUrl(assignmentDetails);
 
           const teacherDoc = await db.collection('teachers').doc(reqData.teacherId).get();
           const teacherName = teacherDoc.exists ? (teacherDoc.data().name || 'คุณครู') : 'คุณครู';
@@ -859,6 +947,7 @@ async function handleLineEvent(event) {
           await db.collection('requests').doc(reqId).update({
             status: 'assigned_work',
             assignmentDetails: assignmentDetails,
+            assignmentLink: assignmentLink,
             assignedAt: new Date().toISOString(),
             assignedVia: 'LINE_OA',
             auditLogs: updatedLogs
@@ -873,7 +962,8 @@ async function handleLineEvent(event) {
               const studentFlex = buildStudentFlex({
                 ...reqData,
                 status: 'assigned_work',
-                assignmentDetails: assignmentDetails
+                assignmentDetails: assignmentDetails,
+                assignmentLink: assignmentLink
               });
               await sendLineFlexMessage(
                 studentDoc.data().lineUserId,
@@ -1802,6 +1892,129 @@ async function handleLineEvent(event) {
       type: 'text',
       text: '🤖 ขออภัยครับ UTP Smart เป็นระบบอัตโนมัติ ไม่เข้าใจข้อความนี้\n\n📌 หากต้องการดูคำสั่งหรือเมนูการใช้งาน พิมพ์ "เมนู" ได้ตลอด 24 ชม. ครับ'
     }]);
+  }
+}
+
+// ── รายชื่อ LINE ของฝ่ายวัดผล/แอดมินทั้งหมด ──────────────────────
+async function staffLineIds() {
+  const ids = [];
+  try {
+    const cfg = await db.collection('system_config').doc('admin').get();
+    if (cfg.exists) {
+      const d = cfg.data();
+      if (Array.isArray(d.lineUserIds)) ids.push(...d.lineUserIds);
+      else if (d.lineUserId) ids.push(d.lineUserId);
+    }
+    const snap = await db.collection('admin_users').where('isActive', '==', true).get();
+    snap.forEach(d => { if (d.data().lineUserId) ids.push(d.data().lineUserId); });
+  } catch (e) {
+    console.warn('staffLineIds:', e.message);
+  }
+  return Array.from(new Set(ids));
+}
+
+// ดึงลิงก์แรกที่เป็น http/https ออกจากข้อความที่ครูพิมพ์
+function extractUrl(text) {
+  const m = String(text || '').match(/https?:\/\/[^\s]+/i);
+  if (!m) return '';
+  try {
+    const u = new URL(m[0]);
+    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// แยก "ปีการศึกษา" ออกจากรูปแบบ "ภาคเรียน/ปี" เช่น 2/2568
+function academicYear(semester) {
+  const m = String(semester || '').match(/\/\s*(\d{4})/);
+  return m ? m[1] : '-';
+}
+function termOf(semester) {
+  const m = String(semester || '').match(/^\s*(\d)/);
+  return m ? m[1] : '-';
+}
+
+// ── สรุปยอดให้ฝ่ายวัดผลแบบรวบยอด ────────────────────────────────
+//    เดิมยิงข้อความทุกครั้งที่ครูอนุมัติ ถ้ามีนักเรียนเป็นร้อยคน
+//    ฝ่ายวัดผลจะได้ข้อความเป็นร้อย จึงเปลี่ยนมาส่งสรุปครั้งเดียวต่อช่วงเวลา
+const DIGEST_WINDOW_MS = parseInt(process.env.STAFF_DIGEST_MINUTES || '15', 10) * 60 * 1000;
+
+async function notifyStaffDigest({ force = false } = {}) {
+  if (!db) return { sent: false, reason: 'no db' };
+  const ref = db.collection('system_config').doc('staff_digest');
+  try {
+    const snap = await ref.get();
+    const last = snap.exists ? (snap.data().lastSentAt || 0) : 0;
+    if (!force && Date.now() - last < DIGEST_WINDOW_MS) {
+      return { sent: false, reason: 'ยังไม่ถึงรอบถัดไป' };
+    }
+
+    const pending = await db.collection('requests').where('status', '==', 'teacher_approved').get();
+    if (pending.empty) return { sent: false, reason: 'ไม่มีรายการรอ' };
+
+    const rows = pending.docs.map(d => d.data())
+      .sort((a, b) => new Date(b.teacherApprovedAt || 0) - new Date(a.teacherApprovedAt || 0));
+    const preview = rows.slice(0, 5);
+
+    const body = [
+      { type: 'text', text: `มี ${rows.length} รายการรอบันทึกลง SGS`, weight: 'bold', size: 'md', color: '#1D4ED8' },
+      { type: 'separator', margin: 'md' },
+      ...preview.map(r => ({
+        type: 'box', layout: 'vertical', margin: 'md', spacing: 'none',
+        contents: [
+          { type: 'text', text: `${r.studentName || '-'}`, size: 'sm', weight: 'bold', wrap: true },
+          { type: 'text', text: `รหัส ${r.studentId || '-'} · วิชา ${r.subjectCode || '-'} · ปี ${academicYear(r.semester)}/${termOf(r.semester)}`, size: 'xs', color: '#2563EB', wrap: true },
+          { type: 'text', text: `${r.gradeType || '-'} → ${r.newGrade || '-'}`, size: 'xs', color: '#16A34A', weight: 'bold' }
+        ]
+      })),
+      ...(rows.length > preview.length
+        ? [{ type: 'text', text: `และอีก ${rows.length - preview.length} รายการ`, size: 'xs', color: '#6B7280', margin: 'md' }]
+        : [])
+    ];
+
+    const flex = {
+      type: 'bubble', size: 'mega',
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#2563EB', paddingAll: '12px',
+        contents: [{ type: 'text', text: '📢 สรุปงานรอฝ่ายวัดผล', color: '#FFFFFF', weight: 'bold', size: 'sm' }] },
+      body: { type: 'box', layout: 'vertical', paddingAll: '14px', contents: body },
+      footer: { type: 'box', layout: 'vertical', paddingAll: '10px', contents: [
+        { type: 'button', style: 'primary', color: '#2563EB', height: 'sm',
+          action: { type: 'message', label: 'ดูรายการทั้งหมด', text: 'รอวัดผล' } }
+      ]}
+    };
+
+    const targets = await staffLineIds();
+    for (const id of targets) {
+      await sendLineFlexMessage(id, `มี ${rows.length} รายการรอฝ่ายวัดผลบันทึกลง SGS`, flex);
+    }
+    await ref.set({ lastSentAt: Date.now() }, { merge: true });
+    return { sent: true, count: rows.length, targets: targets.length };
+  } catch (e) {
+    console.warn('notifyStaffDigest:', e.message);
+    return { sent: false, reason: e.message };
+  }
+}
+
+// แจ้งฝ่ายวัดผลทันทีเมื่อ "แก้เกรดที่อนุมัติไปแล้ว" — เป็นเหตุการณ์ที่ต้องรู้ทันที
+async function notifyStaffGradeChanged(reqData, oldGrade, newGrade, teacherName) {
+  const targets = await staffLineIds();
+  const flex = {
+    type: 'bubble', size: 'kilo',
+    header: { type: 'box', layout: 'vertical', backgroundColor: '#B45309', paddingAll: '12px',
+      contents: [{ type: 'text', text: '⚠️ มีการแก้เกรดที่อนุมัติแล้ว', color: '#FFFFFF', weight: 'bold', size: 'sm' }] },
+    body: { type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '12px', contents: [
+      { type: 'text', text: reqData.studentName || '-', weight: 'bold', size: 'sm', wrap: true },
+      { type: 'text', text: `รหัส ${reqData.studentId || '-'} · วิชา ${reqData.subjectCode || '-'}`, size: 'xs', color: '#2563EB', weight: 'bold', wrap: true },
+      { type: 'text', text: `ปีการศึกษา ${academicYear(reqData.semester)} ภาคเรียน ${termOf(reqData.semester)}`, size: 'xs', color: '#4B5563' },
+      { type: 'separator', margin: 'sm' },
+      { type: 'text', text: `เกรด ${oldGrade} → ${newGrade}`, size: 'md', weight: 'bold', color: '#B45309', margin: 'sm' },
+      { type: 'text', text: 'โดย ' + (teacherName || '-'), size: 'xs', color: '#6B7280' },
+      { type: 'text', text: 'หากบันทึกลง SGS ไปแล้ว กรุณาแก้ให้ตรงกัน', size: 'xs', color: '#B45309', wrap: true, margin: 'sm' }
+    ]}
+  };
+  for (const id of targets) {
+    await sendLineFlexMessage(id, `แก้เกรด: ${reqData.studentName} ${oldGrade} → ${newGrade}`, flex);
   }
 }
 
