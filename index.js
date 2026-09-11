@@ -135,6 +135,17 @@ async function sendLineReply(replyToken, messages) {
 }
 
 // ── Flex Card: แจ้งเตือนครู + ปุ่มอนุมัติในแชต + Magic Link ──────
+// ประกอบบรรทัด "นักเรียน" โดยข้ามส่วนที่ไม่มีข้อมูล
+// (นักเรียนที่ผูกบัญชีผ่าน LINE จะยังไม่มีชั้น/เลขที่ จนกว่าจะกรอกบนเว็บ)
+function formatStudentLine(req) {
+  const parts = [];
+  if (req.studentClass) parts.push(req.studentClass);
+  if (req.studentNo) parts.push('เลขที่ ' + req.studentNo);
+  if (req.studentId) parts.push('รหัส ' + req.studentId);
+  const detail = parts.join(' · ');
+  return (req.studentName || '-') + (detail ? '\n' + detail : '');
+}
+
 function buildTeacherFlex(req, magicUrl) {
   const gradeEmoji = req.gradeType === '0' ? '🔴' : req.gradeType === 'ร' ? '🟡' : '🟠';
   const gradeLabel = req.gradeType === '0' ? 'ผลการเรียน 0' : req.gradeType === 'ร' ? 'ร (รอส่งงาน)' : 'มส (ขาดสอบ/เวลาไม่พอ)';
@@ -157,16 +168,27 @@ function buildTeacherFlex(req, magicUrl) {
       }
     });
   } else {
-    // ผลการเรียน "ร" สามารถเลือกเกรดได้
-    actionButtons.push({
-      type: 'box', layout: 'horizontal', spacing: 'sm',
-      contents: [
-        { type: 'button', style: 'primary', color: '#0B6623', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 1', data: `action=approve&reqId=${req.id}&grade=1`, displayText: 'อนุมัติเกรด 1' } },
-        { type: 'button', style: 'primary', color: '#1B5E20', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 2', data: `action=approve&reqId=${req.id}&grade=2`, displayText: 'อนุมัติเกรด 2' } },
-        { type: 'button', style: 'primary', color: '#2E7D32', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 3', data: `action=approve&reqId=${req.id}&grade=3`, displayText: 'อนุมัติเกรด 3' } },
-        { type: 'button', style: 'primary', color: '#388E3C', height: 'sm', flex: 1, action: { type: 'postback', label: 'เกรด 4', data: `action=approve&reqId=${req.id}&grade=4`, displayText: 'อนุมัติเกรด 4' } },
-      ]
+    // ผลการเรียน "ร" ให้เกรดได้ตามคะแนนจริง — ใช้ตัวเลือกชุดเดียวกับบนเว็บ
+    // ป้ายปุ่มเป็นตัวเลขล้วน เพราะ 4 ปุ่มต่อแถวบน LINE ถ้าใส่คำว่า "เกรด" จะถูกตัดเหลือ "เกร..."
+    const gradeRow = (grades) => ({
+      type: 'box', layout: 'horizontal', spacing: 'xs',
+      contents: grades.map((g, i) => ({
+        type: 'button', style: 'primary', color: ['#0B6623', '#1B5E20', '#2E7D32', '#388E3C'][i % 4],
+        height: 'sm', flex: 1,
+        action: {
+          type: 'postback',
+          label: String(g),
+          data: `action=approve&reqId=${req.id}&grade=${g}`,
+          displayText: `อนุมัติเกรด ${g} วิชา ${req.subjectCode || ''}`.trim()
+        }
+      }))
     });
+
+    actionButtons.push({
+      type: 'text', text: 'แตะเกรดใหม่ที่ต้องการให้', size: 'xs', color: '#666666', align: 'center'
+    });
+    actionButtons.push(gradeRow(['1', '1.5', '2', '2.5']));
+    actionButtons.push(gradeRow(['3', '3.5', '4']));
   }
 
   // ปุ่มสั่งงานในแชต
@@ -204,7 +226,7 @@ function buildTeacherFlex(req, magicUrl) {
       contents: [
         { type: 'box', layout: 'horizontal', contents: [
           { type: 'text', text: '👤 นักเรียน', color: '#888888', size: 'sm', flex: 2 },
-          { type: 'text', text: (req.studentName || '-') + '\n' + (req.studentClass || '') + ' เลขที่ ' + (req.studentNo || ''), size: 'sm', weight: 'bold', flex: 4, wrap: true },
+          { type: 'text', text: formatStudentLine(req), size: 'sm', weight: 'bold', flex: 4, wrap: true },
         ]},
         { type: 'box', layout: 'horizontal', contents: [
           { type: 'text', text: '📚 วิชา', color: '#888888', size: 'sm', flex: 2 },
