@@ -1783,22 +1783,58 @@ async function handleLineEvent(event) {
   }
 }
 
+// ── ตรวจผู้เรียกจาก Firebase ID token (Authorization: Bearer ...) ──
+//    แทน shared secret เดิมที่เคยฝังอยู่ในหน้าเว็บ
+async function callerClaims(req) {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) return null;
+  try {
+    return await admin.auth().verifyIdToken(h.slice(7));
+  } catch (e) {
+    return null;
+  }
+}
+
+// รับได้ทั้ง secret (เรียกจากเซิร์ฟเวอร์ด้วยกัน) และ ID token (เรียกจากหน้าเว็บ)
+async function authorizeNotify(req) {
+  if (req.body?.secret && req.body.secret === WEBHOOK_SECRET) return { via: 'secret' };
+  const claims = await callerClaims(req);
+  return claims ? { via: 'token', claims } : null;
+}
+
 // ════════════════════════════════════════════════════════════════
 // ROUTE: POST /notify-teacher (เรียกจาก Web App เมื่อนักเรียนยื่นคำร้อง)
 // Body: { secret, requestId, teacherId, request: {...} }
 // ════════════════════════════════════════════════════════════════
 app.post('/notify-teacher', async (req, res) => {
-  const { secret, requestId, teacherId, request: reqData } = req.body;
+  const { requestId, teacherId, request: body } = req.body;
 
-  if (secret !== WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  if (!teacherId || !reqData) {
+  const auth = await authorizeNotify(req);
+  if (!auth) return res.status(401).json({ error: 'Unauthorized' });
+  if (!teacherId || !body) {
     return res.status(400).json({ error: 'Missing teacherId or request data' });
   }
 
   try {
     if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+
+    // อ่านคำร้องจากฐานข้อมูลเอง ไม่เชื่อเนื้อหาที่หน้าเว็บส่งมา
+    const reqId = requestId || body.id;
+    const reqSnap = reqId ? await db.collection('requests').doc(reqId).get() : null;
+    if (!reqSnap || !reqSnap.exists) return res.status(404).json({ error: 'Request not found' });
+    const reqData = reqSnap.data();
+
+    if (reqData.teacherId !== teacherId) {
+      return res.status(400).json({ error: 'teacherId ไม่ตรงกับคำร้อง' });
+    }
+    // ผู้เรียกต้องเป็นเจ้าของคำร้อง ครูของวิชานั้น หรือแอดมิน
+    if (auth.via === 'token') {
+      const c = auth.claims;
+      const allowed = (c.role === 'student' && c.sid === reqData.studentId)
+        || (c.role === 'teacher' && c.tid === reqData.teacherId)
+        || c.role === 'admin' || c.role === 'staff';
+      if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+    }
 
     const teacherDoc = await db.collection('teachers').doc(teacherId).get();
     if (!teacherDoc.exists) return res.status(404).json({ error: 'Teacher not found' });
@@ -1827,14 +1863,30 @@ app.post('/notify-teacher', async (req, res) => {
 // Body: { secret, studentId, request: {...} }
 // ════════════════════════════════════════════════════════════════
 app.post('/notify-student', async (req, res) => {
-  const { secret, studentId, request: reqData } = req.body;
+  const { studentId, request: body } = req.body;
 
-  if (secret !== WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  const auth = await authorizeNotify(req);
+  if (!auth) return res.status(401).json({ error: 'Unauthorized' });
+  if (!studentId || !body) return res.status(400).json({ error: 'Missing studentId or request data' });
 
   try {
     if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+
+    // อ่านคำร้องจากฐานข้อมูลเอง ไม่เชื่อเนื้อหาที่หน้าเว็บส่งมา
+    const reqSnap = body.id ? await db.collection('requests').doc(body.id).get() : null;
+    if (!reqSnap || !reqSnap.exists) return res.status(404).json({ error: 'Request not found' });
+    const reqData = reqSnap.data();
+
+    if (reqData.studentId !== studentId) {
+      return res.status(400).json({ error: 'studentId ไม่ตรงกับคำร้อง' });
+    }
+    // ผู้เรียกต้องเป็นครูของวิชานั้น หรือแอดมิน
+    if (auth.via === 'token') {
+      const c = auth.claims;
+      const allowed = (c.role === 'teacher' && c.tid === reqData.teacherId)
+        || c.role === 'admin' || c.role === 'staff';
+      if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+    }
 
     const studentDoc = await db.collection('students').doc(studentId).get();
     if (!studentDoc.exists) return res.json({ sent: false, reason: 'Student not found' });
