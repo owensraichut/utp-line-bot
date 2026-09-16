@@ -2182,11 +2182,21 @@ async function getMailTransporter() {
   }
 
   if (user && pass) {
-    mailTransporter = nodemailer.createTransport({
+    const isGmail = host.includes('gmail.com') || (user && user.includes('@gmail.com'));
+    mailTransporter = nodemailer.createTransport(isGmail ? {
+      service: 'gmail',
+      auth: { user, pass },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 15000
+    } : {
       host,
       port,
       secure: port === 465,
-      auth: { user, pass }
+      auth: { user, pass },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 15000
     });
     activeSmtpUser = user;
     console.log(`📧 Mail transporter active for: ${user}`);
