@@ -2789,7 +2789,12 @@ app.post('/api/auth/teacher', async (req, res) => {
       ok: true,
       token,
       usingDefaultPin: pin === DEFAULT_TEACHER_PIN,
-      teacher: { id, name: tDoc.data().name || '', department: tDoc.data().department || '' }
+      teacher: {
+        id,
+        name: tDoc.data().name || '',
+        department: tDoc.data().department || '',
+        email: tDoc.data().email || ''
+      }
     });
   } catch (err) {
     console.error('auth/teacher:', err);
@@ -2853,7 +2858,8 @@ app.post('/api/auth/teacher-by-qr', async (req, res) => {
       teacher: {
         id,
         name: tDoc.exists ? tDoc.data().name || '' : reqData.teacherName || '',
-        department: tDoc.exists ? tDoc.data().department || '' : ''
+        department: tDoc.exists ? tDoc.data().department || '' : '',
+        email: tDoc.exists ? tDoc.data().email || '' : ''
       },
       request: reqData
     });
