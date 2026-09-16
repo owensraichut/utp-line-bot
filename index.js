@@ -36,20 +36,7 @@ const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '465');
 
 let mailTransporter = null;
-if (SMTP_USER && SMTP_PASS) {
-  mailTransporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-  });
-  console.log(`📧 Mail transporter ready for: ${SMTP_USER}`);
-} else {
-  console.log('ℹ️ SMTP credentials not set. Running email in sandbox/preview mode.');
-}
+let activeSmtpUser = '';
 
 // ── Firebase Admin Init ─────────────────────────────────────────
 let db;
@@ -2151,24 +2138,83 @@ app.post('/notify-student', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 // EMAIL HELPERS & TEMPLATES
 // ════════════════════════════════════════════════════════════════
+function maskEmail(email) {
+  if (!email || typeof email !== 'string' || !email.includes('@')) return email || '';
+  const [user, domain] = email.split('@');
+  if (user.length <= 2) return `${user[0]}*@${domain}`;
+  const first = user.slice(0, 2);
+  const last = user.slice(-1);
+  return `${first}${'*'.repeat(Math.max(3, user.length - 3))}${last}@${domain}`;
+}
+
+async function getMailTransporter() {
+  if (mailTransporter) return { transporter: mailTransporter, user: activeSmtpUser };
+
+  let user = process.env.SMTP_USER || '';
+  let pass = process.env.SMTP_PASS || '';
+  let host = process.env.SMTP_HOST || 'smtp.gmail.com';
+  let port = parseInt(process.env.SMTP_PORT || '465');
+
+  // ตรวจสอบข้อมูลจาก Firestore system_config/smtp ที่บันทึกไว้
+  if ((!user || !pass) && db) {
+    try {
+      const snap = await db.collection('system_config').doc('smtp').get();
+      if (snap.exists) {
+        const d = snap.data();
+        if (d.user && d.pass) {
+          user = d.user;
+          pass = d.pass;
+          host = d.host || host;
+          port = d.port || port;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not read smtp from db:', e.message);
+    }
+  }
+
+  // Fallback: ใช้ Gmail App Password สำหรับระบบโรงเรียนอุเทนพัฒนา
+  if (!user || !pass) {
+    user = 'sirachut25432@gmail.com';
+    pass = 'bawofudsaflptalv';
+    host = 'smtp.gmail.com';
+    port = 465;
+  }
+
+  if (user && pass) {
+    mailTransporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      auth: { user, pass }
+    });
+    activeSmtpUser = user;
+    console.log(`📧 Mail transporter active for: ${user}`);
+    return { transporter: mailTransporter, user };
+  }
+
+  return { transporter: null, user: '' };
+}
+
 async function sendSystemEmail({ to, subject, htmlText }) {
   const fromName = 'โรงเรียนอุเทนพัฒนา (SGS Smart)';
-  const fromAddress = SMTP_USER || 'sgs.utenpatten@gmail.com';
+  const { transporter, user } = await getMailTransporter();
+  const fromAddress = user || 'sirachut25432@gmail.com';
 
-  if (!mailTransporter) {
+  if (!transporter) {
     console.log(`[EMAIL SANDBOX] To: ${to} | Subject: ${subject}`);
     logEvent('EMAIL_SANDBOX', { to, subject });
     return { sent: true, mode: 'sandbox', to, subject };
   }
 
   try {
-    const info = await mailTransporter.sendMail({
+    const info = await transporter.sendMail({
       from: `"${fromName}" <${fromAddress}>`,
       to,
       subject,
       html: htmlText,
     });
-    console.log(`✅ Email sent successfully: ${info.messageId}`);
+    console.log(`✅ Email sent successfully to ${to}: ${info.messageId}`);
     logEvent('EMAIL_SENT', { to, subject, messageId: info.messageId });
     return { sent: true, messageId: info.messageId };
   } catch (err) {
@@ -2232,8 +2278,8 @@ function buildPinResetEmailHtml({ name, role, otp, resetUrl }) {
 // Body: { role: 'teacher'|'student', identifier: phone|studentId, email: string }
 // ════════════════════════════════════════════════════════════════
 app.post('/api/request-pin-reset', async (req, res) => {
-  const { role, identifier, email } = req.body;
-  if (!role || !identifier || !email) {
+  const { role, identifier, email } = req.body || {};
+  if (!role || !identifier) {
     return res.status(400).json({ error: 'กรุณาระบุข้อมูลให้ครบถ้วน' });
   }
 
@@ -2241,36 +2287,68 @@ app.post('/api/request-pin-reset', async (req, res) => {
     if (!db) return res.status(500).json({ error: 'Firebase not connected' });
 
     let matchedUser = null;
+    let targetEmail = String(email || '').trim().toLowerCase();
+
     if (role === 'teacher') {
-      // อีเมลอาจย้ายไป teacher_secrets แล้ว — ตรวจทั้งสองที่
       const [tSnap, sSnap] = await Promise.all([
         db.collection('teachers').get(),
         db.collection('teacher_secrets').get()
       ]);
       const secrets = {};
       sSnap.forEach(d => { secrets[d.id] = d.data(); });
-      const wantedEmail = String(email).trim().toLowerCase();
 
       tSnap.forEach(doc => {
         const d = doc.data();
         const sec = secrets[doc.id] || {};
         const mail = String(sec.email || d.email || '').toLowerCase();
-        if (doc.id === identifier || d.phone === identifier || (mail && mail === wantedEmail)) {
-          matchedUser = { id: doc.id, ...d };
+        if (doc.id === identifier || d.phone === identifier || (targetEmail && mail === targetEmail)) {
+          matchedUser = { id: doc.id, email: sec.email || d.email, ...d };
         }
       });
     } else {
-      const docSnap = await db.collection('students').doc(identifier).get();
+      const id = String(identifier).trim();
+      const [docSnap, secSnap] = await Promise.all([
+        db.collection('students').doc(id).get(),
+        db.collection('student_secrets').doc(id).get()
+      ]);
+
       if (docSnap.exists) {
-        matchedUser = { id: docSnap.id, ...docSnap.data() };
+        const d = docSnap.data();
+        const s = secSnap.exists ? secSnap.data() : {};
+        matchedUser = { id: docSnap.id, email: s.email || d.email, ...d };
       } else {
-        const q = await db.collection('students').where('studentId', '==', identifier).limit(1).get();
-        if (!q.empty) matchedUser = { id: q.docs[0].id, ...q.docs[0].data() };
+        const q = await db.collection('students').where('studentId', '==', id).limit(1).get();
+        if (!q.empty) {
+          const d = q.docs[0].data();
+          const sid = q.docs[0].id;
+          const s = (await db.collection('student_secrets').doc(sid).get()).data() || {};
+          matchedUser = { id: sid, email: s.email || d.email, ...d };
+        }
       }
     }
 
     if (!matchedUser) {
       return res.status(404).json({ error: `ไม่พบข้อมูลผู้ใช้ในระบบ กรุณาตรวจสอบ${role === 'teacher' ? 'เบอร์โทรศัพท์' : 'รหัสนักเรียน'}` });
+    }
+
+    // กำหนดอีเมลเป้าหมาย:
+    // 1) ถ้าไม่ได้ส่ง email มา ให้ดึงจากฐานข้อมูล (student_secrets / teacher_secrets หรือ students / teachers)
+    // 2) ถ้าในฐานข้อมูลยังไม่มีอีเมล และผู้ใช้ไม่ได้ระบุมา ให้แจ้งเตือนให้ผู้ใช้กรอก
+    if (!targetEmail) {
+      targetEmail = String(matchedUser.email || '').trim().toLowerCase();
+    }
+
+    if (!targetEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail)) {
+      return res.json({
+        needsEmail: true,
+        message: 'ยังไม่มีอีเมลในระบบ กรุณากรอกอีเมลของท่านเพื่อรับรหัส OTP'
+      });
+    }
+
+    // หากใน secrets ยังไม่มีอีเมล แต่ตอนนี้ผู้ใช้กรอกมา ให้บันทึกผูกไว้สำหรับครั้งต่อไป
+    if (!matchedUser.email) {
+      const secretCol = role === 'teacher' ? 'teacher_secrets' : 'student_secrets';
+      await writeSecret(secretCol, matchedUser.id, { email: targetEmail });
     }
 
     // สร้าง OTP 6 หลัก และ Reset Token
@@ -2284,7 +2362,7 @@ app.post('/api/request-pin-reset', async (req, res) => {
       role,
       targetId: matchedUser.id,
       name: matchedUser.name || matchedUser.teacherName || 'ผู้ใช้งาน',
-      email: email.trim().toLowerCase(),
+      email: targetEmail,
       expiresAt,
       used: false,
       createdAt: new Date().toISOString()
@@ -2299,14 +2377,16 @@ app.post('/api/request-pin-reset', async (req, res) => {
     });
 
     const emailRes = await sendSystemEmail({
-      to: email.trim(),
+      to: targetEmail,
       subject: `[UTP SGS] รหัสยืนยัน OTP สำหรับตั้งค่า PIN ใหม่ (${otp})`,
       htmlText: emailHtml
     });
 
+    const masked = maskEmail(targetEmail);
     res.json({
       success: true,
-      message: `ส่งรหัส OTP 6 หลักไปยัง ${email} เรียบร้อยแล้ว (รหัสมีอายุ 15 นาที)`,
+      message: `ส่งรหัส OTP 6 หลักไปยัง ${masked} เรียบร้อยแล้ว (รหัสมีอายุ 15 นาที)`,
+      maskedEmail: masked,
       token,
       expiresAt,
       // กรณี sandbox mode แสดง OTP ให้ทดสอบได้สะดวก
@@ -2387,11 +2467,17 @@ app.post('/api/verify-pin-reset', async (req, res) => {
       timestamp: new Date().toISOString()
     });
 
+    // สร้าง custom token สำหรับเข้าสู่ระบบอัตโนมัติทันที
+    const loginToken = resetDoc.role === 'teacher'
+      ? await mintToken('tch_' + resetDoc.targetId, { role: 'teacher', tid: resetDoc.targetId })
+      : await mintToken('stu_' + resetDoc.targetId, { role: 'student', sid: resetDoc.targetId });
+
     res.json({
       success: true,
-      message: `เปลี่ยนรหัส PIN สำหรับ ${resetDoc.name} สำเร็จเรียบร้อยแล้ว ท่านสามารถเข้าสู่ระบบด้วยรหัส PIN ใหม่ได้ทันทีครับ`,
+      message: `เปลี่ยนรหัส PIN สำหรับ ${resetDoc.name} สำเร็จเรียบร้อยแล้ว`,
       role: resetDoc.role,
-      targetId: resetDoc.targetId
+      targetId: resetDoc.targetId,
+      token: loginToken
     });
   } catch (err) {
     console.error('verify-pin-reset error:', err);
@@ -2531,11 +2617,17 @@ app.post('/api/auth/student', async (req, res) => {
 // ── นักเรียน: ลงทะเบียนครั้งแรก + ตั้ง PIN ────────────────────────
 app.post('/api/auth/student-register', async (req, res) => {
   try {
-    const { studentId, pin, name, studentClass, studentNo } = req.body || {};
+    const { studentId, pin, name, studentClass, studentNo, email } = req.body || {};
     const id = String(studentId || '').trim();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+
     if (!/^\d{5}$/.test(id) || !isPin(pin) || !String(name || '').trim()) {
       return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
     }
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ error: 'กรุณากรอกอีเมลที่ถูกต้องเพื่อใช้กู้คืนรหัสผ่าน' });
+    }
+
     // ถ้ามี PIN อยู่แล้ว ห้ามตั้งทับ — ต้องไปทางรีเซ็ตเท่านั้น
     const existing = await studentSecret(id, 'pin');
     if (existing) {
@@ -2546,13 +2638,14 @@ app.post('/api/auth/student-register', async (req, res) => {
       id,
       name: String(name).trim(),
       studentClass: String(studentClass || '').trim(),
-      studentNo: String(studentNo || '').trim()
+      studentNo: String(studentNo || '').trim(),
+      email: cleanEmail
     };
     await db.collection('students').doc(id).set(
       { ...clean, createdAt: new Date().toISOString() },
       { merge: true }
     );
-    await writeSecret('student_secrets', id, { pin });
+    await writeSecret('student_secrets', id, { pin, email: cleanEmail });
 
     const token = await mintToken('stu_' + id, { role: 'student', sid: id });
     res.json({ ok: true, token, student: clean });
