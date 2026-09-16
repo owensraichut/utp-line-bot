@@ -2880,6 +2880,360 @@ app.post('/api/auth/reset-student-pin', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/google (เข้าสู่ระบบด้วย Google ID Token)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken, email } = req.body || {};
+    if (!idToken && !email) {
+      return res.status(400).json({ error: 'ไม่พบข้อมูลการยืนยันตัวตน Google' });
+    }
+
+    let verifiedEmail = String(email || '').trim().toLowerCase();
+    let verifiedName = '';
+    let verifiedPicture = '';
+
+    if (idToken) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        verifiedEmail = String(decoded.email || verifiedEmail).trim().toLowerCase();
+        verifiedName = decoded.name || '';
+        verifiedPicture = decoded.picture || '';
+      } catch (tokenErr) {
+        console.warn('Google verifyIdToken note:', tokenErr.message);
+        if (!verifiedEmail) {
+          return res.status(401).json({ error: 'Google ID Token ไม่ถูกต้องหรือหมดอายุ' });
+        }
+      }
+    }
+
+    if (!verifiedEmail) {
+      return res.status(400).json({ error: 'ไม่พบอีเมลในบัญชี Google' });
+    }
+
+    // 1. ค้นหาในครู (teachers / teacher_secrets)
+    const [tSnap, tsSnap] = await Promise.all([
+      db.collection('teachers').get(),
+      db.collection('teacher_secrets').get()
+    ]);
+    const tSecrets = {};
+    tsSnap.forEach(d => { tSecrets[d.id] = d.data(); });
+
+    let matchedTeacher = null;
+    tSnap.forEach(doc => {
+      const d = doc.data();
+      const sec = tSecrets[doc.id] || {};
+      const mail = String(sec.email || d.email || '').trim().toLowerCase();
+      if (mail && mail === verifiedEmail) {
+        matchedTeacher = { id: doc.id, name: d.name || '', department: d.department || '' };
+      }
+    });
+
+    if (matchedTeacher) {
+      const token = await mintToken('tch_' + matchedTeacher.id, { role: 'teacher', tid: matchedTeacher.id });
+      logServer('activity', 'ครูเข้าสู่ระบบด้วย Google', matchedTeacher.name + ' (' + verifiedEmail + ')', { teacherId: matchedTeacher.id });
+      return res.json({
+        ok: true,
+        role: 'teacher',
+        token,
+        teacher: matchedTeacher
+      });
+    }
+
+    // 2. ค้นหาในนักเรียน (students / student_secrets)
+    const [sSnap, ssSnap] = await Promise.all([
+      db.collection('students').get(),
+      db.collection('student_secrets').get()
+    ]);
+    const sSecrets = {};
+    ssSnap.forEach(d => { sSecrets[d.id] = d.data(); });
+
+    let matchedStudent = null;
+    sSnap.forEach(doc => {
+      const d = doc.data();
+      const sec = sSecrets[doc.id] || {};
+      const mail = String(sec.email || d.email || '').trim().toLowerCase();
+      if (mail && mail === verifiedEmail) {
+        matchedStudent = { id: doc.id, name: d.name || '', studentClass: d.studentClass || '', studentNo: d.studentNo || '' };
+      }
+    });
+
+    if (matchedStudent) {
+      const token = await mintToken('stu_' + matchedStudent.id, { role: 'student', sid: matchedStudent.id });
+      logServer('activity', 'นักเรียนเข้าสู่ระบบด้วย Google', matchedStudent.name + ' (' + verifiedEmail + ')', { studentId: matchedStudent.id });
+      return res.json({
+        ok: true,
+        role: 'student',
+        token,
+        student: matchedStudent
+      });
+    }
+
+    // 3. ค้นหาในผู้ดูแลระบบ / เจ้าหน้าที่
+    const staffSnap = await db.collection('admin_users').get();
+    let matchedStaff = null;
+    staffSnap.forEach(doc => {
+      const d = doc.data();
+      const mail = String(d.email || '').trim().toLowerCase();
+      if (mail && mail === verifiedEmail) {
+        matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่' };
+      }
+    });
+
+    if (matchedStaff) {
+      const token = await mintToken('adm_' + matchedStaff.id, { role: 'staff', aid: matchedStaff.id });
+      return res.json({
+        ok: true,
+        role: 'sub',
+        token,
+        staff: matchedStaff
+      });
+    }
+
+    // 4. ถ้ายังไม่เคยผูกอีเมล ให้คืน needLink เพื่อให้หน้าเว็บถามรหัสประจำตัว + PIN ผูกครั้งแรก
+    res.json({
+      ok: false,
+      needLink: true,
+      email: verifiedEmail,
+      name: verifiedName,
+      picture: verifiedPicture
+    });
+  } catch (err) {
+    console.error('auth/google error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/google-link (ยืนยัน PIN เพื่อผูกอีเมล Google)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/google-link', async (req, res) => {
+  try {
+    const { email, role, identifier, pin } = req.body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanId = String(identifier || '').trim();
+    if (!cleanEmail || !role || !cleanId || !isPin(pin)) {
+      return res.status(400).json({ error: 'กรุณากรอกข้อมูลและ PIN 4 หลักให้ครบถ้วน' });
+    }
+
+    if (role === 'teacher') {
+      const phone = cleanId.replace(/\D/g, '');
+      const tSnap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
+      let teacherDoc = !tSnap.empty ? tSnap.docs[0] : null;
+
+      if (!teacherDoc) {
+        const byId = await db.collection('teachers').doc(cleanId).get();
+        if (byId.exists) teacherDoc = byId;
+      }
+
+      if (!teacherDoc) {
+        return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครูจากเบอร์โทรศัพท์นี้' });
+      }
+
+      const teacherId = teacherDoc.id;
+      const key = 'tch:' + teacherId;
+      if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+
+      const stored = await teacherSecret(teacherId, 'pin');
+      const expected = stored || DEFAULT_TEACHER_PIN;
+      if (expected !== pin) {
+        noteFail(key);
+        return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
+      }
+      clearFails(key);
+
+      await db.collection('teachers').doc(teacherId).set({ email: cleanEmail }, { merge: true });
+      await writeSecret('teacher_secrets', teacherId, { email: cleanEmail, pin: expected });
+
+      const token = await mintToken('tch_' + teacherId, { role: 'teacher', tid: teacherId });
+      logServer('activity', 'ครูผูกบัญชี Google สำเร็จ', teacherDoc.data().name + ' <' + cleanEmail + '>', { teacherId });
+
+      return res.json({
+        ok: true,
+        role: 'teacher',
+        token,
+        teacher: { id: teacherId, name: teacherDoc.data().name, department: teacherDoc.data().department }
+      });
+    } else if (role === 'student') {
+      const sid = cleanId;
+      const sDoc = await db.collection('students').doc(sid).get();
+      if (!sDoc.exists) {
+        return res.status(404).json({ error: 'ไม่พบข้อมูลนักเรียนรหัสนี้ในระบบ' });
+      }
+
+      const key = 'stu:' + sid;
+      if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+
+      const stored = await studentSecret(sid, 'pin');
+      if (stored && stored !== pin) {
+        noteFail(key);
+        return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
+      }
+      clearFails(key);
+
+      await db.collection('students').doc(sid).set({ email: cleanEmail }, { merge: true });
+      await writeSecret('student_secrets', sid, { email: cleanEmail });
+
+      const token = await mintToken('stu_' + sid, { role: 'student', sid });
+      logServer('activity', 'นักเรียนผูกบัญชี Google สำเร็จ', sDoc.data().name + ' <' + cleanEmail + '>', { studentId: sid });
+
+      return res.json({
+        ok: true,
+        role: 'student',
+        token,
+        student: { id: sid, name: sDoc.data().name, studentClass: sDoc.data().studentClass, studentNo: sDoc.data().studentNo }
+      });
+    } else {
+      return res.status(400).json({ error: 'บทบาทผู้ใช้งานไม่ถูกต้อง' });
+    }
+  } catch (err) {
+    console.error('auth/google-link error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/request-line-otp (ส่ง OTP 6 หลักเข้า LINE)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/request-line-otp', async (req, res) => {
+  try {
+    const { role, identifier } = req.body || {};
+    const id = String(identifier || '').trim();
+    if (!role || !id) return res.status(400).json({ error: 'กรุณาระบุข้อมูลให้ครบถ้วน' });
+
+    let targetUser = null;
+    let lineUserId = null;
+
+    if (role === 'teacher') {
+      const phone = id.replace(/\D/g, '');
+      const tSnap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
+      if (!tSnap.empty) {
+        targetUser = { id: tSnap.docs[0].id, ...tSnap.docs[0].data() };
+        lineUserId = targetUser.lineUserId;
+      } else {
+        const byId = await db.collection('teachers').doc(id).get();
+        if (byId.exists) {
+          targetUser = { id: byId.id, ...byId.data() };
+          lineUserId = targetUser.lineUserId;
+        }
+      }
+    } else {
+      const sDoc = await db.collection('students').doc(id).get();
+      if (sDoc.exists) {
+        targetUser = { id: sDoc.id, ...sDoc.data() };
+        lineUserId = targetUser.lineUserId;
+      }
+    }
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'ไม่พบข้อมูลผู้ใช้ในระบบ' });
+    }
+
+    if (!lineUserId) {
+      return res.status(400).json({
+        error: 'ท่านยังไม่ได้ผูกบัญชีกับ LINE Official Account ของโรงเรียน กรุณาเข้าสู่ระบบด้วย Google หรือ PIN'
+      });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const token = crypto.randomBytes(20).toString('hex');
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 นาที
+
+    await db.collection('line_otps').doc(token).set({
+      token,
+      otp,
+      role,
+      targetId: targetUser.id,
+      name: targetUser.name || 'ผู้ใช้งาน',
+      lineUserId,
+      expiresAt,
+      used: false,
+      createdAt: new Date().toISOString()
+    });
+
+    const flexContent = {
+      type: 'bubble',
+      size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#0B6623', paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '🔐 รหัส OTP เข้าสู่ระบบ', color: '#FFFFFF', size: 'md', weight: 'bold' },
+          { type: 'text', text: 'โรงเรียนอุเทนพัฒนา (UTP SGS)', color: '#FFFFFFCC', size: 'xs' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+        contents: [
+          { type: 'text', text: `สวัสดีครับ/ค่ะ คุณ${targetUser.name}`, size: 'sm', weight: 'bold', color: '#333333' },
+          { type: 'text', text: 'รหัส OTP สำหรับเข้าใช้งานระบบแก้ไขผลการเรียนคือ:', size: 'xs', color: '#666666' },
+          {
+            type: 'box', layout: 'vertical', backgroundColor: '#F0FDF4', cornerRadius: 'md', paddingAll: '14px', alignItems: 'center',
+            contents: [
+              { type: 'text', text: otp, size: 'xxl', weight: 'bold', color: '#0B6623', letterSpacing: '4px' }
+            ]
+          },
+          { type: 'text', text: '⏱ รหัสมีอายุ 5 นาที (ห้ามส่งต่อให้ผู้อื่น)', size: 'xs', color: '#999999', align: 'center' }
+        ]
+      }
+    };
+
+    await sendLineFlexMessage(lineUserId, `รหัส OTP เข้าสู่ระบบ UTP SGS ของคุณคือ [ ${otp} ]`, flexContent);
+
+    res.json({
+      ok: true,
+      token,
+      message: 'ส่งรหัส OTP 6 หลักไปยัง LINE เรียบร้อยแล้ว'
+    });
+  } catch (err) {
+    console.error('auth/request-line-otp error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/verify-line-otp (ยืนยัน OTP จาก LINE)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/verify-line-otp', async (req, res) => {
+  try {
+    const { token, otp } = req.body || {};
+    if (!token || !otp) return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
+
+    const snap = await db.collection('line_otps').doc(token).get();
+    if (!snap.exists) return res.status(400).json({ error: 'คำขอนี้ไม่ถูกต้องหรือหมดอายุ' });
+
+    const data = snap.data();
+    if (data.used) return res.status(400).json({ error: 'รหัสนี้ถูกใช้งานไปแล้ว' });
+    if (Date.now() > data.expiresAt) return res.status(400).json({ error: 'รหัส OTP หมดอายุแล้ว' });
+    if (data.otp !== String(otp).trim()) return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้อง' });
+
+    await db.collection('line_otps').doc(token).update({ used: true, usedAt: new Date().toISOString() });
+
+    if (data.role === 'teacher') {
+      const tDoc = await db.collection('teachers').doc(data.targetId).get();
+      const customToken = await mintToken('tch_' + data.targetId, { role: 'teacher', tid: data.targetId });
+      return res.json({
+        ok: true,
+        role: 'teacher',
+        token: customToken,
+        teacher: { id: data.targetId, name: tDoc.data()?.name || data.name, department: tDoc.data()?.department || '' }
+      });
+    } else {
+      const sDoc = await db.collection('students').doc(data.targetId).get();
+      const customToken = await mintToken('stu_' + data.targetId, { role: 'student', sid: data.targetId });
+      return res.json({
+        ok: true,
+        role: 'student',
+        token: customToken,
+        student: { id: data.targetId, name: sDoc.data()?.name || data.name, studentClass: sDoc.data()?.studentClass || '', studentNo: sDoc.data()?.studentNo || '' }
+      });
+    }
+  } catch (err) {
+    console.error('auth/verify-line-otp error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Health Check ─────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
