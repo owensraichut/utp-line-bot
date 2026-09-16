@@ -3142,18 +3142,33 @@ app.post('/api/auth/google', async (req, res) => {
     }
 
     // 3. ค้นหาในผู้ดูแลระบบ / เจ้าหน้าที่
+    const SUPER_ADMIN_EMAILS = ['sirachut25432@gmail.com'];
+    let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
     const staffSnap = await db.collection('admin_users').get();
     let matchedStaff = null;
     staffSnap.forEach(doc => {
       const d = doc.data();
       const mail = String(d.email || '').trim().toLowerCase();
       if (mail && mail === verifiedEmail) {
-        matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่' };
+        matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', role: d.role };
+        if (d.role === 'super' || doc.id === 'super') isSuperAdmin = true;
       }
     });
 
+    if (isSuperAdmin) {
+      const token = await mintToken('adm_super', { role: 'admin', aid: 'super' });
+      logServer('activity', 'Super Admin เข้าสู่ระบบด้วย Google', 'Super Admin (' + verifiedEmail + ')', { email: verifiedEmail });
+      return res.json({
+        ok: true,
+        role: 'super',
+        token,
+        staff: { id: 'super', name: matchedStaff?.name || 'Super Admin (ผู้ดูแลระบบสูงสุด)', email: verifiedEmail }
+      });
+    }
+
     if (matchedStaff) {
       const token = await mintToken('adm_' + matchedStaff.id, { role: 'staff', aid: matchedStaff.id });
+      logServer('activity', 'เจ้าหน้าที่เข้าสู่ระบบด้วย Google', matchedStaff.name + ' (' + verifiedEmail + ')', { staffId: matchedStaff.id });
       return res.json({
         ok: true,
         role: 'sub',
@@ -3487,18 +3502,37 @@ app.post('/api/auth/verify-email-otp', async (req, res) => {
       });
     }
 
-    // 3. เจ้าหน้าที่วัดผล / แอดมิน
+    // 3. เจ้าหน้าที่วัดผล / ซูเปอร์แอดมิน
+    const SUPER_ADMIN_EMAILS = ['sirachut25432@gmail.com'];
+    let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
     const adminSnap = await db.collection('admin_users').where('email', '==', verifiedEmail).limit(1).get();
+    let matchedAdmin = null;
     if (!adminSnap.empty) {
       const aDoc = adminSnap.docs[0];
       const aData = aDoc.data();
-      const role = aData.role === 'super' ? 'super' : 'sub';
-      const token = await mintToken('adm_' + aDoc.id, { role, adminId: aDoc.id });
+      matchedAdmin = { id: aDoc.id, name: aData.name, email: aData.email, role: aData.role };
+      if (aData.role === 'super' || aDoc.id === 'super') isSuperAdmin = true;
+    }
+
+    if (isSuperAdmin) {
+      const token = await mintToken('adm_super', { role: 'admin', aid: 'super' });
+      logServer('activity', 'Super Admin เข้าสู่ระบบด้วย Email OTP', 'Super Admin (' + verifiedEmail + ')', { email: verifiedEmail });
       return res.json({
         ok: true,
-        role,
+        role: 'super',
         token,
-        staff: { id: aDoc.id, name: aData.name, email: aData.email }
+        staff: { id: 'super', name: matchedAdmin?.name || 'Super Admin (ผู้ดูแลระบบสูงสุด)', email: verifiedEmail }
+      });
+    }
+
+    if (matchedAdmin) {
+      const token = await mintToken('adm_' + matchedAdmin.id, { role: 'staff', aid: matchedAdmin.id });
+      logServer('activity', 'เจ้าหน้าที่เข้าสู่ระบบด้วย Email OTP', matchedAdmin.name + ' (' + verifiedEmail + ')', { staffId: matchedAdmin.id });
+      return res.json({
+        ok: true,
+        role: 'sub',
+        token,
+        staff: matchedAdmin
       });
     }
 
@@ -3510,6 +3544,50 @@ app.post('/api/auth/verify-email-otp', async (req, res) => {
     });
   } catch (err) {
     console.error('verify-email-otp error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/unlink-account (Super Admin ปลดล็อก/ยกเลิกผูกอีเมล)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/unlink-account', async (req, res) => {
+  try {
+    const { role, id } = req.body || {};
+    const targetId = String(id || '').trim();
+    if (!role || !targetId) {
+      return res.status(400).json({ error: 'กรุณาระบุประเภทบัญชีและรหัสประจำตัว' });
+    }
+
+    if (role === 'teacher') {
+      await Promise.all([
+        db.collection('teachers').doc(targetId).update({
+          email: admin.firestore.FieldValue.delete()
+        }).catch(() => {}),
+        db.collection('teacher_secrets').doc(targetId).update({
+          email: admin.firestore.FieldValue.delete()
+        }).catch(() => {})
+      ]);
+      logServer('activity', 'Super Admin ยกเลิกการผูกอีเมลครู', 'รหัสครู: ' + targetId, { targetId });
+      return res.json({ ok: true, message: 'ยกเลิกการผูกอีเมลเรียบร้อยแล้ว' });
+    }
+
+    if (role === 'student') {
+      await Promise.all([
+        db.collection('students').doc(targetId).update({
+          email: admin.firestore.FieldValue.delete()
+        }).catch(() => {}),
+        db.collection('student_secrets').doc(targetId).update({
+          email: admin.firestore.FieldValue.delete()
+        }).catch(() => {})
+      ]);
+      logServer('activity', 'Super Admin ยกเลิกการผูกอีเมลนักเรียน', 'รหัสนักเรียน: ' + targetId, { targetId });
+      return res.json({ ok: true, message: 'ยกเลิกการผูกอีเมลเรียบร้อยแล้ว' });
+    }
+
+    return res.status(400).json({ error: 'ประเภทบัญชีไม่ถูกต้อง' });
+  } catch (err) {
+    console.error('unlink-account error:', err);
     res.status(500).json({ error: err.message });
   }
 });
