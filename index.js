@@ -3177,29 +3177,39 @@ app.post('/api/auth/google', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// ROUTE: POST /api/auth/google-link (ยืนยัน PIN เพื่อผูกอีเมล Google)
+// ROUTE: POST /api/auth/google-link (กรอกข้อมูลพื้นฐานเพื่อเชื่อมต่อระบบในครั้งแรก)
 // ════════════════════════════════════════════════════════════════
-app.post('/api/auth/google-link', async (req, res) => {
+const handleLinkAccount = async (req, res) => {
   try {
-    const { email, role, identifier, pin } = req.body || {};
+    const { email, role, identifier, teacherId: reqTeacherId, phone: reqPhone, pin, name, studentClass, studentNo, isNewStudent } = req.body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanId = String(identifier || '').trim();
-    if (!cleanEmail || !role || !cleanId || !isPin(pin)) {
+    if (!cleanEmail || !role || (!cleanId && !reqTeacherId) || !isPin(pin)) {
       return res.status(400).json({ error: 'กรุณากรอกข้อมูลและ PIN 4 หลักให้ครบถ้วน' });
     }
 
     if (role === 'teacher') {
-      const phone = cleanId.replace(/\D/g, '');
-      const tSnap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
-      let teacherDoc = !tSnap.empty ? tSnap.docs[0] : null;
+      let teacherDoc = null;
+      const targetTeacherId = String(reqTeacherId || (cleanId && !/^\d{9,10}$/.test(cleanId) ? cleanId : '')).trim();
 
-      if (!teacherDoc) {
+      if (targetTeacherId) {
+        const byId = await db.collection('teachers').doc(targetTeacherId).get();
+        if (byId.exists) teacherDoc = byId;
+      }
+
+      const rawPhone = String(reqPhone || cleanId || '').replace(/\D/g, '');
+      if (!teacherDoc && rawPhone) {
+        const tSnap = await db.collection('teachers').where('phone', '==', rawPhone).limit(1).get();
+        if (!tSnap.empty) teacherDoc = tSnap.docs[0];
+      }
+
+      if (!teacherDoc && cleanId) {
         const byId = await db.collection('teachers').doc(cleanId).get();
         if (byId.exists) teacherDoc = byId;
       }
 
       if (!teacherDoc) {
-        return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครูจากเบอร์โทรศัพท์นี้' });
+        return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครูจากฐานข้อมูลโรงเรียน กรุณาเลือกชื่อของท่านจากรายการ' });
       }
 
       const teacherId = teacherDoc.id;
@@ -3210,15 +3220,20 @@ app.post('/api/auth/google-link', async (req, res) => {
       const expected = stored || DEFAULT_TEACHER_PIN;
       if (expected !== pin) {
         noteFail(key);
-        return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
+        return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง (รหัสเริ่มต้นคือ 2026)' });
       }
       clearFails(key);
 
-      await db.collection('teachers').doc(teacherId).set({ email: cleanEmail }, { merge: true });
+      const updateData = { email: cleanEmail };
+      if (rawPhone && rawPhone.length === 10) {
+        updateData.phone = rawPhone;
+      }
+
+      await db.collection('teachers').doc(teacherId).set(updateData, { merge: true });
       await writeSecret('teacher_secrets', teacherId, { email: cleanEmail, pin: expected });
 
       const token = await mintToken('tch_' + teacherId, { role: 'teacher', tid: teacherId });
-      logServer('activity', 'ครูผูกบัญชี Google สำเร็จ', teacherDoc.data().name + ' <' + cleanEmail + '>', { teacherId });
+      logServer('activity', 'คุณครูบันทึกข้อมูลพื้นฐานและผูกอีเมลสำเร็จ', (teacherDoc.data().name || teacherId) + ' <' + cleanEmail + '>', { teacherId });
 
       return res.json({
         ok: true,
@@ -3228,11 +3243,62 @@ app.post('/api/auth/google-link', async (req, res) => {
       });
     } else if (role === 'student') {
       const sid = cleanId;
-      const sDoc = await db.collection('students').doc(sid).get();
-      if (!sDoc.exists) {
-        return res.status(404).json({ error: 'ไม่พบข้อมูลนักเรียนรหัสนี้ในระบบ' });
+      if (!/^\d{5}$/.test(sid)) {
+        return res.status(400).json({ error: 'รหัสนักเรียนต้องเป็นตัวเลข 5 หลัก' });
       }
 
+      const sDoc = await db.collection('students').doc(sid).get();
+
+      // กรณีลงทะเบียนนักเรียนใหม่ หรือยังไม่มีข้อมูลในระบบ
+      if (isNewStudent || !sDoc.exists) {
+        const cleanName = String(name || '').trim();
+        const cleanClass = String(studentClass || '').trim();
+        const cleanNo = String(studentNo || '').trim();
+
+        if (!cleanName) {
+          return res.status(400).json({ error: 'กรุณาระบุชื่อ-นามสกุลนักเรียน' });
+        }
+        if (!cleanClass) {
+          return res.status(400).json({ error: 'กรุณาระบุชั้นและห้องเรียน' });
+        }
+        if (!cleanNo) {
+          return res.status(400).json({ error: 'กรุณาระบุเลขที่นักเรียน' });
+        }
+
+        // หากมีรหัสนี้อยู่แล้ว ตรวจสอบว่า PIN ตรงกันหรือไม่
+        if (sDoc.exists) {
+          const storedPin = await studentSecret(sid, 'pin');
+          if (storedPin && storedPin !== pin) {
+            return res.status(409).json({ error: 'รหัสนักเรียนนี้มีอยู่ในระบบแล้ว กรุณาเข้าสู่ระบบด้วย PIN เดิม หรือกู้คืนรหัสผ่าน' });
+          }
+        }
+
+        const studentData = {
+          id: sid,
+          studentId: sid,
+          name: cleanName,
+          studentClass: cleanClass,
+          studentNo: cleanNo,
+          email: cleanEmail,
+          createdAt: sDoc.exists ? (sDoc.data().createdAt || new Date().toISOString()) : new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+
+        await db.collection('students').doc(sid).set(studentData, { merge: true });
+        await writeSecret('student_secrets', sid, { email: cleanEmail, pin });
+
+        const token = await mintToken('stu_' + sid, { role: 'student', sid });
+        logServer('activity', 'นักเรียนลงทะเบียนข้อมูลพื้นฐานและผูกอีเมลสำเร็จ', cleanName + ' (' + sid + ') <' + cleanEmail + '>', { studentId: sid });
+
+        return res.json({
+          ok: true,
+          role: 'student',
+          token,
+          student: { id: sid, name: cleanName, studentClass: cleanClass, studentNo: cleanNo }
+        });
+      }
+
+      // กรณีผูกบัญชีนักเรียนเดิมที่มีข้อมูลอยู่แล้ว
       const key = 'stu:' + sid;
       if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
 
@@ -3244,10 +3310,10 @@ app.post('/api/auth/google-link', async (req, res) => {
       clearFails(key);
 
       await db.collection('students').doc(sid).set({ email: cleanEmail }, { merge: true });
-      await writeSecret('student_secrets', sid, { email: cleanEmail });
+      await writeSecret('student_secrets', sid, { email: cleanEmail, pin });
 
       const token = await mintToken('stu_' + sid, { role: 'student', sid });
-      logServer('activity', 'นักเรียนผูกบัญชี Google สำเร็จ', sDoc.data().name + ' <' + cleanEmail + '>', { studentId: sid });
+      logServer('activity', 'นักเรียนผูกบัญชีอีเมลสำเร็จ', (sDoc.data().name || sid) + ' <' + cleanEmail + '>', { studentId: sid });
 
       return res.json({
         ok: true,
@@ -3260,6 +3326,190 @@ app.post('/api/auth/google-link', async (req, res) => {
     }
   } catch (err) {
     console.error('auth/google-link error:', err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+app.post('/api/auth/google-link', handleLinkAccount);
+app.post('/api/auth/link-account', handleLinkAccount);
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/request-email-otp (ส่ง OTP 6 หลักเข้าอีเมลเพื่อเข้าสู่ระบบ)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/request-email-otp', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      return res.status(400).json({ error: 'กรุณาระบุที่อยู่อีเมลที่ถูกต้อง' });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const token = crypto.randomBytes(20).toString('hex');
+    const expiresAt = Date.now() + 15 * 60 * 1000;
+
+    await db.collection('email_login_otps').doc(token).set({
+      token,
+      email: cleanEmail,
+      otp,
+      expiresAt,
+      used: false,
+      createdAt: new Date().toISOString()
+    });
+
+    const emailSubject = `รหัส OTP เข้าสู่ระบบ UTP SGS: ${otp}`;
+    const emailHtml = `
+      <div style="font-family: sans-serif; padding: 24px; background: #0f172a; color: #f8fafc; border-radius: 16px; max-width: 500px; margin: 0 auto; border: 1px solid #334155;">
+        <h2 style="color: #38bdf8; margin: 0 0 8px 0;">🏫 โรงเรียนอุเทนพัฒนา</h2>
+        <p style="color: #94a3b8; font-size: 14px; margin-bottom: 20px;">ระบบแก้ไขผลการเรียนดิจิทัล (UTP SGS)</p>
+        <p style="color: #e2e8f0; font-size: 15px;">รหัสยืนยัน OTP สำหรับเข้าสู่ระบบด้วยอีเมลของท่านคือ:</p>
+        <div style="background: #1e293b; border: 2px dashed #0284c7; border-radius: 12px; padding: 16px; text-align: center; margin: 20px 0;">
+          <div style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #38bdf8; font-family: monospace;">${otp}</div>
+          <div style="font-size: 12px; color: #94a3b8; margin-top: 6px;">(รหัสหมดอายุภายใน 15 นาที)</div>
+        </div>
+        <p style="color: #64748b; font-size: 12px;">หากท่านไม่ได้เป็นผู้ร้องขอเข้าสู่ระบบ โปรดเพิกเฉยต่ออีเมลฉบับนี้</p>
+      </div>
+    `;
+
+    const sendRes = await sendSystemEmail({
+      to: cleanEmail,
+      subject: emailSubject,
+      htmlText: emailHtml
+    });
+
+    const sentOk = sendRes && sendRes.sent;
+    return res.json({
+      ok: true,
+      email: cleanEmail,
+      token,
+      expiresAt,
+      ...(!sentOk || sendRes.mode === 'sandbox' || sendRes.mode === 'fallback'
+        ? { previewOtp: otp, isFallback: !sentOk }
+        : {})
+    });
+  } catch (err) {
+    console.error('request-email-otp error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/verify-email-otp (ตรวจสอบ OTP อีเมล)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/verify-email-otp', async (req, res) => {
+  try {
+    const { token, email, otp } = req.body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanOtp = String(otp || '').trim();
+
+    if (!cleanOtp || (!token && !cleanEmail)) {
+      return res.status(400).json({ error: 'กรุณาระบุรหัส OTP และอีเมลให้ครบถ้วน' });
+    }
+
+    let otpDoc = null;
+    let otpDocId = null;
+
+    if (token) {
+      const snap = await db.collection('email_login_otps').doc(token).get();
+      if (snap.exists) {
+        otpDoc = snap.data();
+        otpDocId = snap.id;
+      }
+    }
+
+    if (!otpDoc && cleanEmail) {
+      const q = await db.collection('email_login_otps')
+        .where('email', '==', cleanEmail)
+        .where('otp', '==', cleanOtp)
+        .where('used', '==', false)
+        .limit(1)
+        .get();
+      if (!q.empty) {
+        otpDoc = q.docs[0].data();
+        otpDocId = q.docs[0].id;
+      }
+    }
+
+    if (!otpDoc || otpDoc.used || otpDoc.otp !== cleanOtp) {
+      return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้องหรือถูกใช้งานไปแล้ว' });
+    }
+
+    if (Date.now() > otpDoc.expiresAt) {
+      return res.status(400).json({ error: 'รหัส OTP หมดอายุแล้ว กรุณาขอรหัสใหม่' });
+    }
+
+    await db.collection('email_login_otps').doc(otpDocId).update({ used: true, usedAt: new Date().toISOString() });
+
+    const verifiedEmail = otpDoc.email;
+
+    // ตรวจสอบว่าเคยผูกบัญชีไว้หรือไม่
+    // 1. ครู
+    const [tSnap, tsSnap] = await Promise.all([
+      db.collection('teachers').where('email', '==', verifiedEmail).limit(1).get(),
+      db.collection('teacher_secrets').where('email', '==', verifiedEmail).limit(1).get()
+    ]);
+    let teacherId = null;
+    if (!tSnap.empty) teacherId = tSnap.docs[0].id;
+    else if (!tsSnap.empty) teacherId = tsSnap.docs[0].id;
+
+    if (teacherId) {
+      const tDoc = await db.collection('teachers').doc(teacherId).get();
+      const tData = tDoc.exists ? tDoc.data() : {};
+      const token = await mintToken('tch_' + teacherId, { role: 'teacher', tid: teacherId });
+      logServer('activity', 'คุณครูเข้าสู่ระบบสำเร็จผ่าน Email OTP', (tData.name || teacherId) + ' <' + verifiedEmail + '>', { teacherId });
+      return res.json({
+        ok: true,
+        role: 'teacher',
+        token,
+        teacher: { id: teacherId, name: tData.name, department: tData.department }
+      });
+    }
+
+    // 2. นักเรียน
+    const [sSnap, ssSnap] = await Promise.all([
+      db.collection('students').where('email', '==', verifiedEmail).limit(1).get(),
+      db.collection('student_secrets').where('email', '==', verifiedEmail).limit(1).get()
+    ]);
+    let studentId = null;
+    if (!sSnap.empty) studentId = sSnap.docs[0].id;
+    else if (!ssSnap.empty) studentId = ssSnap.docs[0].id;
+
+    if (studentId) {
+      const sDoc = await db.collection('students').doc(studentId).get();
+      const sData = sDoc.exists ? sDoc.data() : {};
+      const token = await mintToken('stu_' + studentId, { role: 'student', sid: studentId });
+      logServer('activity', 'นักเรียนเข้าสู่ระบบสำเร็จผ่าน Email OTP', (sData.name || studentId) + ' <' + verifiedEmail + '>', { studentId });
+      return res.json({
+        ok: true,
+        role: 'student',
+        token,
+        student: { id: studentId, name: sData.name, studentClass: sData.studentClass, studentNo: sData.studentNo }
+      });
+    }
+
+    // 3. เจ้าหน้าที่วัดผล / แอดมิน
+    const adminSnap = await db.collection('admin_users').where('email', '==', verifiedEmail).limit(1).get();
+    if (!adminSnap.empty) {
+      const aDoc = adminSnap.docs[0];
+      const aData = aDoc.data();
+      const role = aData.role === 'super' ? 'super' : 'sub';
+      const token = await mintToken('adm_' + aDoc.id, { role, adminId: aDoc.id });
+      return res.json({
+        ok: true,
+        role,
+        token,
+        staff: { id: aDoc.id, name: aData.name, email: aData.email }
+      });
+    }
+
+    // หากยังไม่เคยผูกข้อมูลในระบบ ให้ส่ง needLink เพื่อนำเข้าหน้ากรอกข้อมูลพื้นฐาน
+    return res.json({
+      ok: false,
+      needLink: true,
+      email: verifiedEmail
+    });
+  } catch (err) {
+    console.error('verify-email-otp error:', err);
     res.status(500).json({ error: err.message });
   }
 });
