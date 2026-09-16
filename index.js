@@ -2412,10 +2412,19 @@ app.post('/api/request-pin-reset', async (req, res) => {
       });
     }
 
-    // หากใน secrets ยังไม่มีอีเมล แต่ตอนนี้ผู้ใช้กรอกมา ให้บันทึกผูกไว้สำหรับครั้งต่อไป
+    // หากใน secrets หรือเอกสารหลักยังไม่มีอีเมล แต่ตอนนี้ผู้ใช้กรอกมา ให้บันทึกผูกไว้สำหรับครั้งต่อไป
     if (!matchedUser.email) {
       const secretCol = role === 'teacher' ? 'teacher_secrets' : 'student_secrets';
       await writeSecret(secretCol, matchedUser.id, { email: targetEmail });
+      const mainCol = role === 'teacher' ? 'teachers' : 'students';
+      try {
+        await db.collection(mainCol).doc(matchedUser.id).set({
+          email: targetEmail,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+      } catch (e) {
+        console.warn('Failed to sync email in request-pin-reset:', e.message);
+      }
     }
 
     // สร้าง OTP 6 หลัก และ Reset Token
@@ -2529,6 +2538,19 @@ app.post('/api/verify-pin-reset', async (req, res) => {
       pinUpdatedAt: new Date().toISOString()
     });
 
+    // ซิงค์อีเมลลงคอลเลกชันหลักเพื่อให้ Super Admin และหน้าเว็บตรวจสอบได้ถูกต้อง
+    if (resetDoc.email) {
+      const mainCol = resetDoc.role === 'teacher' ? 'teachers' : 'students';
+      try {
+        await db.collection(mainCol).doc(resetDoc.targetId).set({
+          email: resetDoc.email,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+      } catch (e) {
+        console.warn('Failed to sync email in verify-pin-reset:', e.message);
+      }
+    }
+
     // มาร์ก resetDoc เป็น used
     await db.collection('pin_resets').doc(resetDocId).update({
       used: true,
@@ -2545,6 +2567,26 @@ app.post('/api/verify-pin-reset', async (req, res) => {
       timestamp: new Date().toISOString()
     });
 
+    // โหลดข้อมูลผู้ใช้เพื่อส่งกลับให้หน้าเว็บนำไปเข้าสู่ระบบอัตโนมัติได้ทันที
+    let userObj = null;
+    try {
+      const mainCol = resetDoc.role === 'teacher' ? 'teachers' : 'students';
+      const uSnap = await db.collection(mainCol).doc(resetDoc.targetId).get();
+      if (uSnap.exists) {
+        const uData = uSnap.data();
+        userObj = {
+          id: uSnap.id,
+          name: uData.name || resetDoc.name || '',
+          email: resetDoc.email || uData.email || '',
+          ...(resetDoc.role === 'teacher'
+            ? { department: uData.department || '' }
+            : { studentClass: uData.studentClass || uData.class || '', studentNo: uData.studentNo || '' })
+        };
+      }
+    } catch (uErr) {
+      console.warn('Fetch userObj in verify-pin-reset:', uErr.message);
+    }
+
     // สร้าง custom token สำหรับเข้าสู่ระบบอัตโนมัติทันที
     const loginToken = resetDoc.role === 'teacher'
       ? await mintToken('tch_' + resetDoc.targetId, { role: 'teacher', tid: resetDoc.targetId })
@@ -2555,7 +2597,9 @@ app.post('/api/verify-pin-reset', async (req, res) => {
       message: `เปลี่ยนรหัส PIN สำหรับ ${resetDoc.name} สำเร็จเรียบร้อยแล้ว`,
       role: resetDoc.role,
       targetId: resetDoc.targetId,
-      token: loginToken
+      token: loginToken,
+      student: resetDoc.role === 'student' ? userObj : undefined,
+      teacher: resetDoc.role === 'teacher' ? userObj : undefined
     });
   } catch (err) {
     console.error('verify-pin-reset error:', err);
@@ -2675,6 +2719,14 @@ app.post('/api/auth/student', async (req, res) => {
     clearFails(key);
 
     const data = doc.data();
+    let email = data.email;
+    if (!email) {
+      email = await studentSecret(id, 'email');
+      if (email) {
+        await db.collection('students').doc(id).set({ email }, { merge: true }).catch(() => {});
+      }
+    }
+
     const token = await mintToken('stu_' + id, { role: 'student', sid: id });
     res.json({
       ok: true,
@@ -2683,7 +2735,8 @@ app.post('/api/auth/student', async (req, res) => {
         id,
         name: data.name || '',
         studentClass: data.studentClass || data.class || '',
-        studentNo: data.studentNo || ''
+        studentNo: data.studentNo || '',
+        email: email || ''
       }
     });
   } catch (err) {
@@ -2823,6 +2876,138 @@ app.post('/api/auth/teacher-change-pin', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('auth/teacher-change-pin:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── นักเรียน: เปลี่ยน PIN 4 หลัก ──────────────────────────────────
+app.post('/api/auth/student-change-pin', async (req, res) => {
+  try {
+    const { studentId, currentPin, newPin } = req.body || {};
+    const id = String(studentId || '').trim();
+    if (!id || !isPin(currentPin) || !isPin(newPin)) {
+      return res.status(400).json({ error: 'กรุณากรอก PIN 4 หลักให้ครบถ้วน' });
+    }
+    const key = 'stu:' + id;
+    if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+
+    const stored = await studentSecret(id, 'pin');
+    if (!stored || stored !== currentPin) {
+      noteFail(key);
+      return res.status(401).json({ error: 'PIN ปัจจุบันไม่ถูกต้อง' });
+    }
+    clearFails(key);
+    await writeSecret('student_secrets', id, { pin: newPin, pinUpdatedAt: new Date().toISOString() });
+    logServer('activity', 'นักเรียนเปลี่ยนรหัส PIN สำเร็จ', 'รหัสนักเรียน: ' + id, { studentId: id });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('auth/student-change-pin:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── นักเรียน: ผูก / เปลี่ยนอีเมล (ขณะ Login อยู่) ──────────────────
+// step=request: ยืนยัน PIN → ส่ง OTP ไปอีเมลใหม่ → คืน token
+// step=verify : ยืนยัน PIN + OTP → บันทึกอีเมล → คืน student object
+app.post('/api/auth/student-link-email', async (req, res) => {
+  try {
+    const { studentId, pin, email, step, otpToken, otp } = req.body || {};
+    const id = String(studentId || '').trim();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+
+    if (!id) return res.status(400).json({ error: 'กรุณาระบุรหัสนักเรียน' });
+    if (!isPin(pin)) return res.status(400).json({ error: 'กรุณากรอก PIN 4 หลัก' });
+
+    // ยืนยัน PIN ก่อนทุก step
+    const key = 'stu:' + id;
+    if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
+    const stored = await studentSecret(id, 'pin');
+    if (!stored || stored !== pin) {
+      noteFail(key);
+      return res.status(401).json({ error: 'PIN ไม่ถูกต้อง' });
+    }
+    clearFails(key);
+
+    if (step === 'request') {
+      if (!cleanEmail || !cleanEmail.includes('@')) {
+        return res.status(400).json({ error: 'กรุณากรอกอีเมลที่ถูกต้อง' });
+      }
+      const sDoc = await db.collection('students').doc(id).get();
+      if (!sDoc.exists) return res.status(404).json({ error: 'ไม่พบข้อมูลนักเรียน' });
+
+      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const token = crypto.randomBytes(20).toString('hex');
+      const expiresAt = Date.now() + 15 * 60 * 1000;
+
+      // ใช้ Firestore collection เดียวกับ request-email-otp
+      await db.collection('email_login_otps').doc(token).set({
+        token, email: cleanEmail, otp: otpCode, expiresAt,
+        used: false, studentId: id, purpose: 'link_email',
+        createdAt: new Date().toISOString()
+      });
+
+      const studentName = sDoc.data().name || id;
+      const emailSubject = `รหัส OTP ผูกอีเมล UTP SGS: ${otpCode}`;
+      const emailHtml = `
+        <div style="font-family: sans-serif; padding: 24px; background: #0f172a; color: #f8fafc; border-radius: 16px; max-width: 500px; margin: 0 auto; border: 1px solid #334155;">
+          <h2 style="color: #38bdf8; margin: 0 0 8px 0;">🏫 โรงเรียนอุเทนพัฒนา</h2>
+          <p style="color: #94a3b8; font-size: 14px; margin-bottom: 20px;">ระบบแก้ไขผลการเรียนดิจิทัล (UTP SGS)</p>
+          <p style="color: #e2e8f0; font-size: 15px;">สวัสดี <strong>${studentName}</strong></p>
+          <p style="color: #e2e8f0; font-size: 15px;">รหัส OTP สำหรับผูกอีเมลกับบัญชีนักเรียนของท่านคือ:</p>
+          <div style="background: #1e293b; border: 2px dashed #0284c7; border-radius: 12px; padding: 16px; text-align: center; margin: 20px 0;">
+            <div style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #38bdf8; font-family: monospace;">${otpCode}</div>
+            <div style="font-size: 12px; color: #94a3b8; margin-top: 6px;">(รหัสหมดอายุภายใน 15 นาที)</div>
+          </div>
+          <p style="color: #64748b; font-size: 12px;">หากท่านไม่ได้เป็นผู้ร้องขอ โปรดเพิกเฉยต่ออีเมลฉบับนี้</p>
+        </div>
+      `;
+
+      const sendRes = await sendSystemEmail({ to: cleanEmail, subject: emailSubject, htmlText: emailHtml });
+      const sentOk = sendRes && sendRes.sent;
+      logServer('activity', 'นักเรียนขอผูกอีเมล (ส่ง OTP)', id + ' → ' + cleanEmail, { studentId: id });
+
+      return res.json({
+        ok: true, token,
+        maskedEmail: cleanEmail.replace(/(.{2})(.*)(@.*)/, '$1***$3'),
+        ...(!sentOk || sendRes.mode === 'sandbox' || sendRes.mode === 'fallback'
+          ? { previewOtp: otpCode } : {})
+      });
+    }
+
+    if (step === 'verify') {
+      if (!otpToken || !otp) return res.status(400).json({ error: 'ข้อมูล OTP ไม่ครบถ้วน' });
+
+      const otpDoc = await db.collection('email_login_otps').doc(otpToken).get();
+      if (!otpDoc.exists || otpDoc.data().used) {
+        return res.status(400).json({ error: 'รหัส OTP หมดอายุแล้ว กรุณาขอรหัสใหม่' });
+      }
+      const otpData = otpDoc.data();
+      if (Date.now() > otpData.expiresAt) {
+        return res.status(400).json({ error: 'รหัส OTP หมดอายุแล้ว กรุณาขอรหัสใหม่' });
+      }
+      if (otpData.studentId !== id) return res.status(400).json({ error: 'ข้อมูลไม่ตรงกัน' });
+      if (otpData.otp !== String(otp).trim()) return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้อง' });
+
+      await db.collection('email_login_otps').doc(otpToken).update({ used: true });
+      const verifiedEmail = otpData.email;
+
+      // บันทึกอีเมลทั้งสองที่
+      await db.collection('students').doc(id).set({ email: verifiedEmail }, { merge: true });
+      await writeSecret('student_secrets', id, { email: verifiedEmail });
+
+      const sDoc = await db.collection('students').doc(id).get();
+      const sData = sDoc.data() || {};
+      logServer('activity', 'นักเรียนผูกอีเมลสำเร็จ', id + ' → ' + verifiedEmail, { studentId: id });
+
+      return res.json({
+        ok: true, email: verifiedEmail,
+        student: { id, name: sData.name, studentClass: sData.studentClass, studentNo: sData.studentNo, email: verifiedEmail }
+      });
+    }
+
+    return res.status(400).json({ error: 'กรุณาระบุ step: request หรือ verify' });
+  } catch (err) {
+    console.error('auth/student-link-email:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3062,7 +3247,7 @@ app.post('/api/auth/reset-student-pin', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 app.post('/api/auth/google', async (req, res) => {
   try {
-    const { idToken, email } = req.body || {};
+    const { idToken, email, intendedRole } = req.body || {};
     if (!idToken && !email) {
       return res.status(400).json({ error: 'ไม่พบข้อมูลการยืนยันตัวตน Google' });
     }
@@ -3089,25 +3274,113 @@ app.post('/api/auth/google', async (req, res) => {
       return res.status(400).json({ error: 'ไม่พบอีเมลในบัญชี Google' });
     }
 
-    // 1. ค้นหาในครู (teachers / teacher_secrets)
-    const [tSnap, tsSnap] = await Promise.all([
-      db.collection('teachers').get(),
-      db.collection('teacher_secrets').get()
-    ]);
-    const tSecrets = {};
-    tsSnap.forEach(d => { tSecrets[d.id] = d.data(); });
+    // Helper functions สำหรับค้นหาผู้ใช้ตามบทบาท
+    const checkTeacher = async () => {
+      const [tSnap, tsSnap] = await Promise.all([
+        db.collection('teachers').get(),
+        db.collection('teacher_secrets').get()
+      ]);
+      const tSecrets = {};
+      tsSnap.forEach(d => { tSecrets[d.id] = d.data(); });
+      let matched = null;
+      tSnap.forEach(doc => {
+        const d = doc.data();
+        const sec = tSecrets[doc.id] || {};
+        const mail = String(sec.email || d.email || '').trim().toLowerCase();
+        if (mail && mail === verifiedEmail) {
+          matched = { id: doc.id, name: d.name || '', department: d.department || '', email: verifiedEmail };
+        }
+      });
+      return matched;
+    };
 
-    let matchedTeacher = null;
-    tSnap.forEach(doc => {
-      const d = doc.data();
-      const sec = tSecrets[doc.id] || {};
-      const mail = String(sec.email || d.email || '').trim().toLowerCase();
-      if (mail && mail === verifiedEmail) {
-        matchedTeacher = { id: doc.id, name: d.name || '', department: d.department || '' };
+    const checkStudent = async () => {
+      const [sSnap, ssSnap] = await Promise.all([
+        db.collection('students').get(),
+        db.collection('student_secrets').get()
+      ]);
+      const sSecrets = {};
+      ssSnap.forEach(d => { sSecrets[d.id] = d.data(); });
+      let matched = null;
+      sSnap.forEach(doc => {
+        const d = doc.data();
+        const sec = sSecrets[doc.id] || {};
+        const mail = String(sec.email || d.email || '').trim().toLowerCase();
+        if (mail && mail === verifiedEmail) {
+          matched = { id: doc.id, name: d.name || '', studentClass: d.studentClass || d.class || '', studentNo: d.studentNo || '', email: verifiedEmail };
+        }
+      });
+      return matched;
+    };
+
+    const checkStaff = async () => {
+      const SUPER_ADMIN_EMAILS = ['sirachut25432@gmail.com'];
+      let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
+      const staffSnap = await db.collection('admin_users').get();
+      let matchedStaff = null;
+      staffSnap.forEach(doc => {
+        const d = doc.data();
+        const mail = String(d.email || '').trim().toLowerCase();
+        if (mail && mail === verifiedEmail) {
+          matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', role: d.role, email: verifiedEmail };
+          if (d.role === 'super' || doc.id === 'super') isSuperAdmin = true;
+        }
+      });
+      return { isSuperAdmin, matchedStaff };
+    };
+
+    // กรณีระบุบทบาทนักเรียนโดยตรง (intendedRole === 'student')
+    if (intendedRole === 'student') {
+      const matchedStudent = await checkStudent();
+      if (matchedStudent) {
+        await db.collection('students').doc(matchedStudent.id).set({ email: verifiedEmail }, { merge: true }).catch(() => {});
+        const token = await mintToken('stu_' + matchedStudent.id, { role: 'student', sid: matchedStudent.id });
+        logServer('activity', 'นักเรียนเข้าสู่ระบบด้วย Google', matchedStudent.name + ' (' + verifiedEmail + ')', { studentId: matchedStudent.id });
+        return res.json({
+          ok: true,
+          role: 'student',
+          token,
+          student: matchedStudent
+        });
       }
-    });
+      return res.json({
+        ok: false,
+        needLink: true,
+        role: 'student',
+        email: verifiedEmail,
+        name: verifiedName,
+        picture: verifiedPicture
+      });
+    }
 
+    // กรณีระบุบทบาทครูโดยตรง (intendedRole === 'teacher')
+    if (intendedRole === 'teacher') {
+      const matchedTeacher = await checkTeacher();
+      if (matchedTeacher) {
+        await db.collection('teachers').doc(matchedTeacher.id).set({ email: verifiedEmail }, { merge: true }).catch(() => {});
+        const token = await mintToken('tch_' + matchedTeacher.id, { role: 'teacher', tid: matchedTeacher.id });
+        logServer('activity', 'ครูเข้าสู่ระบบด้วย Google', matchedTeacher.name + ' (' + verifiedEmail + ')', { teacherId: matchedTeacher.id });
+        return res.json({
+          ok: true,
+          role: 'teacher',
+          token,
+          teacher: matchedTeacher
+        });
+      }
+      return res.json({
+        ok: false,
+        needLink: true,
+        role: 'teacher',
+        email: verifiedEmail,
+        name: verifiedName,
+        picture: verifiedPicture
+      });
+    }
+
+    // กรณีทั่วไป (ไม่ระบุ intendedRole): ตรวจ ครู -> นักเรียน -> แอดมิน
+    const matchedTeacher = await checkTeacher();
     if (matchedTeacher) {
+      await db.collection('teachers').doc(matchedTeacher.id).set({ email: verifiedEmail }, { merge: true }).catch(() => {});
       const token = await mintToken('tch_' + matchedTeacher.id, { role: 'teacher', tid: matchedTeacher.id });
       logServer('activity', 'ครูเข้าสู่ระบบด้วย Google', matchedTeacher.name + ' (' + verifiedEmail + ')', { teacherId: matchedTeacher.id });
       return res.json({
@@ -3118,25 +3391,9 @@ app.post('/api/auth/google', async (req, res) => {
       });
     }
 
-    // 2. ค้นหาในนักเรียน (students / student_secrets)
-    const [sSnap, ssSnap] = await Promise.all([
-      db.collection('students').get(),
-      db.collection('student_secrets').get()
-    ]);
-    const sSecrets = {};
-    ssSnap.forEach(d => { sSecrets[d.id] = d.data(); });
-
-    let matchedStudent = null;
-    sSnap.forEach(doc => {
-      const d = doc.data();
-      const sec = sSecrets[doc.id] || {};
-      const mail = String(sec.email || d.email || '').trim().toLowerCase();
-      if (mail && mail === verifiedEmail) {
-        matchedStudent = { id: doc.id, name: d.name || '', studentClass: d.studentClass || '', studentNo: d.studentNo || '' };
-      }
-    });
-
+    const matchedStudent = await checkStudent();
     if (matchedStudent) {
+      await db.collection('students').doc(matchedStudent.id).set({ email: verifiedEmail }, { merge: true }).catch(() => {});
       const token = await mintToken('stu_' + matchedStudent.id, { role: 'student', sid: matchedStudent.id });
       logServer('activity', 'นักเรียนเข้าสู่ระบบด้วย Google', matchedStudent.name + ' (' + verifiedEmail + ')', { studentId: matchedStudent.id });
       return res.json({
@@ -3147,20 +3404,7 @@ app.post('/api/auth/google', async (req, res) => {
       });
     }
 
-    // 3. ค้นหาในผู้ดูแลระบบ / เจ้าหน้าที่
-    const SUPER_ADMIN_EMAILS = ['sirachut25432@gmail.com'];
-    let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
-    const staffSnap = await db.collection('admin_users').get();
-    let matchedStaff = null;
-    staffSnap.forEach(doc => {
-      const d = doc.data();
-      const mail = String(d.email || '').trim().toLowerCase();
-      if (mail && mail === verifiedEmail) {
-        matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', role: d.role };
-        if (d.role === 'super' || doc.id === 'super') isSuperAdmin = true;
-      }
-    });
-
+    const { isSuperAdmin, matchedStaff } = await checkStaff();
     if (isSuperAdmin) {
       const token = await mintToken('adm_super', { role: 'admin', aid: 'super' });
       logServer('activity', 'Super Admin เข้าสู่ระบบด้วย Google', 'Super Admin (' + verifiedEmail + ')', { email: verifiedEmail });
@@ -3183,7 +3427,7 @@ app.post('/api/auth/google', async (req, res) => {
       });
     }
 
-    // 4. ถ้ายังไม่เคยผูกอีเมล ให้คืน needLink เพื่อให้หน้าเว็บถามรหัสประจำตัว + PIN ผูกครั้งแรก
+    // ถ้ายังไม่เคยผูกอีเมล ให้คืน needLink เพื่อให้หน้าเว็บถามรหัสประจำตัว + PIN ผูกครั้งแรก
     res.json({
       ok: false,
       needLink: true,
@@ -3260,7 +3504,7 @@ const handleLinkAccount = async (req, res) => {
         ok: true,
         role: 'teacher',
         token,
-        teacher: { id: teacherId, name: teacherDoc.data().name, department: teacherDoc.data().department }
+        teacher: { id: teacherId, name: teacherDoc.data().name, department: teacherDoc.data().department, email: cleanEmail }
       });
     } else if (role === 'student') {
       const sid = cleanId;
@@ -3315,7 +3559,7 @@ const handleLinkAccount = async (req, res) => {
           ok: true,
           role: 'student',
           token,
-          student: { id: sid, name: cleanName, studentClass: cleanClass, studentNo: cleanNo }
+          student: { id: sid, name: cleanName, studentClass: cleanClass, studentNo: cleanNo, email: cleanEmail }
         });
       }
 
@@ -3340,7 +3584,7 @@ const handleLinkAccount = async (req, res) => {
         ok: true,
         role: 'student',
         token,
-        student: { id: sid, name: sDoc.data().name, studentClass: sDoc.data().studentClass, studentNo: sDoc.data().studentNo }
+        student: { id: sid, name: sDoc.data().name, studentClass: sDoc.data().studentClass, studentNo: sDoc.data().studentNo, email: cleanEmail }
       });
     } else {
       return res.status(400).json({ error: 'บทบาทผู้ใช้งานไม่ถูกต้อง' });
@@ -3482,7 +3726,7 @@ app.post('/api/auth/verify-email-otp', async (req, res) => {
         ok: true,
         role: 'teacher',
         token,
-        teacher: { id: teacherId, name: tData.name, department: tData.department }
+        teacher: { id: teacherId, name: tData.name, department: tData.department, email: verifiedEmail }
       });
     }
 
@@ -3504,7 +3748,7 @@ app.post('/api/auth/verify-email-otp', async (req, res) => {
         ok: true,
         role: 'student',
         token,
-        student: { id: studentId, name: sData.name, studentClass: sData.studentClass, studentNo: sData.studentNo }
+        student: { id: studentId, name: sData.name, studentClass: sData.studentClass, studentNo: sData.studentNo, email: verifiedEmail }
       });
     }
 
