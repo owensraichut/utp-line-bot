@@ -3247,32 +3247,31 @@ app.post('/api/auth/reset-student-pin', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 app.post('/api/auth/google', async (req, res) => {
   try {
-    const { idToken, email, intendedRole } = req.body || {};
-    if (!idToken && !email) {
-      return res.status(400).json({ error: 'ไม่พบข้อมูลการยืนยันตัวตน Google' });
+    // อีเมลต้องมาจาก token ที่ Google/Firebase ลงนามเท่านั้น
+    // ห้ามใช้อีเมลที่หน้าเว็บส่งมาเด็ดขาด — ไม่งั้นใครก็สวมรอยเป็นใครก็ได้แค่รู้อีเมล
+    const { idToken, intendedRole } = req.body || {};
+    if (!idToken) {
+      return res.status(401).json({ error: 'ไม่พบข้อมูลการยืนยันตัวตน Google' });
     }
 
-    let verifiedEmail = String(email || '').trim().toLowerCase();
-    let verifiedName = '';
-    let verifiedPicture = '';
-
-    if (idToken) {
-      try {
-        const decoded = await admin.auth().verifyIdToken(idToken);
-        verifiedEmail = String(decoded.email || verifiedEmail).trim().toLowerCase();
-        verifiedName = decoded.name || '';
-        verifiedPicture = decoded.picture || '';
-      } catch (tokenErr) {
-        console.warn('Google verifyIdToken note:', tokenErr.message);
-        if (!verifiedEmail) {
-          return res.status(401).json({ error: 'Google ID Token ไม่ถูกต้องหรือหมดอายุ' });
-        }
-      }
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (tokenErr) {
+      console.warn('Google verifyIdToken rejected:', tokenErr.message);
+      return res.status(401).json({ error: 'Google ID Token ไม่ถูกต้องหรือหมดอายุ' });
     }
 
-    if (!verifiedEmail) {
-      return res.status(400).json({ error: 'ไม่พบอีเมลในบัญชี Google' });
+    // รับเฉพาะบัญชีที่ล็อกอินผ่าน Google และ Google ยืนยันอีเมลแล้ว
+    // (กันบัญชี email/password ที่ตั้งอีเมลคนอื่นเองโดยไม่ได้ยืนยัน)
+    const provider = decoded.firebase && decoded.firebase.sign_in_provider;
+    if (provider !== 'google.com' || decoded.email_verified !== true || !decoded.email) {
+      return res.status(401).json({ error: 'ต้องเข้าสู่ระบบด้วยบัญชี Google ที่ยืนยันอีเมลแล้ว' });
     }
+
+    const verifiedEmail = String(decoded.email).trim().toLowerCase();
+    const verifiedName = decoded.name || '';
+    const verifiedPicture = decoded.picture || '';
 
     // Helper functions สำหรับค้นหาผู้ใช้ตามบทบาท
     const checkTeacher = async () => {
