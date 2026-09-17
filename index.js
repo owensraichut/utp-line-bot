@@ -56,7 +56,21 @@ try {
 // ── Config ──────────────────────────────────────────────────────
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const BASE_URL = process.env.APP_BASE_URL || 'https://utenpatten-sgs.web.app';
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'utenpatten2024';
+// ค่า 'utenpatten2024' เคยฝังอยู่ในหน้าเว็บสาธารณะ ถือว่ารั่วแล้ว ห้ามใช้ลงนามอีก
+// ถ้ายังไม่ตั้งค่าใหม่ใน env ระบบจะปิด Magic Link และการยืนยันด้วย secret ไว้ก่อน
+const LEAKED_SECRETS = ['utenpatten2024'];
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const SECRET_USABLE = WEBHOOK_SECRET.length >= 24 && !LEAKED_SECRETS.includes(WEBHOOK_SECRET);
+if (!SECRET_USABLE) {
+  console.error('⚠️ WEBHOOK_SECRET ยังเป็นค่าที่รั่ว/สั้นเกินไป — ปิด Magic Link ไว้จนกว่าจะตั้งค่าใหม่ (ยาว ≥ 24 ตัวอักษร)');
+}
+
+// เทียบสตริงแบบเวลาคงที่ กันเดาลายเซ็นจากเวลาตอบกลับ
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a || ''));
+  const y = Buffer.from(String(b || ''));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
 
 // ── In-Memory Sessions & Debug Logs ─────────────────────────────
 const recentLogs = [];
@@ -2019,7 +2033,7 @@ async function callerClaims(req) {
 
 // รับได้ทั้ง secret (เรียกจากเซิร์ฟเวอร์ด้วยกัน) และ ID token (เรียกจากหน้าเว็บ)
 async function authorizeNotify(req) {
-  if (req.body?.secret && req.body.secret === WEBHOOK_SECRET) return { via: 'secret' };
+  if (SECRET_USABLE && req.body?.secret && safeEqual(req.body.secret, WEBHOOK_SECRET)) return { via: 'secret' };
   const claims = await callerClaims(req);
   return claims ? { via: 'token', claims } : null;
 }
@@ -2354,7 +2368,9 @@ app.post('/api/request-pin-reset', async (req, res) => {
     if (!db) return res.status(500).json({ error: 'Firebase not connected' });
 
     let matchedUser = null;
-    let targetEmail = String(email || '').trim().toLowerCase();
+    // อีเมลที่ผู้ขอกรอกใช้ "ค้นหาบัญชี" ได้อย่างเดียว ห้ามใช้เป็นปลายทางส่ง OTP
+    const lookupEmail = String(email || '').trim().toLowerCase();
+    let targetEmail = '';
 
     if (role === 'teacher') {
       const [tSnap, sSnap] = await Promise.all([
@@ -2368,7 +2384,7 @@ app.post('/api/request-pin-reset', async (req, res) => {
         const d = doc.data();
         const sec = secrets[doc.id] || {};
         const mail = String(sec.email || d.email || '').toLowerCase();
-        if (doc.id === identifier || d.phone === identifier || (targetEmail && mail === targetEmail)) {
+        if (doc.id === identifier || d.phone === identifier || (lookupEmail && mail === lookupEmail)) {
           matchedUser = { id: doc.id, email: sec.email || d.email, ...d };
         }
       });
@@ -2398,37 +2414,23 @@ app.post('/api/request-pin-reset', async (req, res) => {
       return res.status(404).json({ error: `ไม่พบข้อมูลผู้ใช้ในระบบ กรุณาตรวจสอบ${role === 'teacher' ? 'เบอร์โทรศัพท์' : 'รหัสนักเรียน'}` });
     }
 
-    // กำหนดอีเมลเป้าหมาย:
-    // 1) ถ้าไม่ได้ส่ง email มา ให้ดึงจากฐานข้อมูล (student_secrets / teacher_secrets หรือ students / teachers)
-    // 2) ถ้าในฐานข้อมูลยังไม่มีอีเมล และผู้ใช้ไม่ได้ระบุมา ให้แจ้งเตือนให้ผู้ใช้กรอก
-    if (!targetEmail) {
-      targetEmail = String(matchedUser.email || '').trim().toLowerCase();
-    }
-
+    // ส่ง OTP ไปที่อีเมลที่เจ้าของบัญชีผูกไว้แล้วเท่านั้น
+    // (เดิมรับอีเมลใหม่จากผู้ขอแล้วผูกให้เลย = ใครรู้เบอร์ครูก็ยึดบัญชีได้)
+    targetEmail = String(matchedUser.email || '').trim().toLowerCase();
     if (!targetEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail)) {
-      return res.json({
-        needsEmail: true,
-        message: 'ยังไม่มีอีเมลในระบบ กรุณากรอกอีเมลของท่านเพื่อรับรหัส OTP'
+      return res.status(409).json({
+        error: role === 'teacher'
+          ? 'บัญชีนี้ยังไม่ได้ผูกอีเมล กรุณาให้ฝ่ายวัดผลรีเซ็ต PIN ให้'
+          : 'บัญชีนี้ยังไม่ได้ผูกอีเมล กรุณาให้ครูประจำวิชารีเซ็ต PIN ให้'
       });
     }
 
-    // หากใน secrets หรือเอกสารหลักยังไม่มีอีเมล แต่ตอนนี้ผู้ใช้กรอกมา ให้บันทึกผูกไว้สำหรับครั้งต่อไป
-    if (!matchedUser.email) {
-      const secretCol = role === 'teacher' ? 'teacher_secrets' : 'student_secrets';
-      await writeSecret(secretCol, matchedUser.id, { email: targetEmail });
-      const mainCol = role === 'teacher' ? 'teachers' : 'students';
-      try {
-        await db.collection(mainCol).doc(matchedUser.id).set({
-          email: targetEmail,
-          updatedAt: new Date().toISOString()
-        }, { merge: true });
-      } catch (e) {
-        console.warn('Failed to sync email in request-pin-reset:', e.message);
-      }
-    }
+    const rkey = 'resetreq:' + role + ':' + matchedUser.id;
+    if (tooManyFails(rkey)) return res.status(429).json({ error: LOCKED_MSG });
+    noteFail(rkey);
 
     // สร้าง OTP 6 หลัก และ Reset Token
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = crypto.randomInt(100000, 1000000).toString();
     const token = crypto.randomBytes(24).toString('hex');
     const expiresAt = Date.now() + 15 * 60 * 1000; // 15 นาที
 
@@ -2465,19 +2467,18 @@ app.post('/api/request-pin-reset', async (req, res) => {
     }
 
     const masked = maskEmail(targetEmail);
-    const sentOk = emailRes && emailRes.sent;
+    const sentOk = emailRes && emailRes.sent && emailRes.mode !== 'sandbox' && emailRes.mode !== 'fallback';
+    if (!sentOk) {
+      await db.collection('pin_resets').doc(token).update({ used: true, failedDelivery: true }).catch(() => {});
+      return res.status(503).json({ error: 'ส่งอีเมลไม่สำเร็จในขณะนี้ กรุณาให้ครูประจำวิชาหรือฝ่ายวัดผลรีเซ็ต PIN ให้' });
+    }
+    // ห้ามคืน OTP ในคำตอบเด็ดขาด — ผู้ขอไม่จำเป็นต้องเป็นเจ้าของบัญชี
     res.json({
       success: true,
-      message: sentOk
-        ? `ส่งรหัส OTP 6 หลักไปยัง ${masked} เรียบร้อยแล้ว (รหัสมีอายุ 15 นาที)`
-        : `ระบบออกรหัส OTP ยืนยันตัวตนให้แล้ว (${masked})`,
+      message: `ส่งรหัส OTP 6 หลักไปยัง ${masked} เรียบร้อยแล้ว (รหัสมีอายุ 15 นาที)`,
       maskedEmail: masked,
       token,
-      expiresAt,
-      // หากส่งเมลตรงไม่ผ่าน (เช่น พอร์ตถูกจำกัดบนคลาวด์) ส่ง OTP สำรองให้ใช้งานได้ทันที 100%
-      ...(!sentOk || emailRes.mode === 'sandbox' || emailRes.mode === 'fallback'
-        ? { previewOtp: otp, isFallback: !sentOk }
-        : {})
+      expiresAt
     });
   } catch (err) {
     console.error('request-pin-reset error:', err);
@@ -2498,29 +2499,24 @@ app.post('/api/verify-pin-reset', async (req, res) => {
   try {
     if (!db) return res.status(500).json({ error: 'Firebase not connected' });
 
+    // ต้องมีทั้ง token และ OTP เสมอ — token อย่างเดียวไม่ใช่หลักฐานว่าเข้าถึงอีเมลได้
+    // (token ถูกคืนให้ผู้ขอ ซึ่งอาจไม่ใช่เจ้าของบัญชี)
+    if (!token || !otp) {
+      return res.status(400).json({ error: 'กรุณากรอกรหัส OTP จากอีเมล' });
+    }
+    if (otpLocked(token)) return res.status(429).json({ error: LOCKED_MSG });
+
     let resetDoc = null;
     let resetDocId = null;
-
-    if (token) {
-      const snap = await db.collection('pin_resets').doc(token).get();
-      if (snap.exists) {
-        resetDoc = snap.data();
-        resetDocId = snap.id;
-      }
-    } else if (otp) {
-      const q = await db.collection('pin_resets')
-        .where('otp', '==', otp.trim())
-        .where('used', '==', false)
-        .limit(1)
-        .get();
-      if (!q.empty) {
-        resetDoc = q.docs[0].data();
-        resetDocId = q.docs[0].id;
-      }
+    const snap = await db.collection('pin_resets').doc(String(token)).get();
+    if (snap.exists) {
+      resetDoc = snap.data();
+      resetDocId = snap.id;
     }
 
-    if (!resetDoc) {
-      return res.status(400).json({ error: 'รหัสยืนยัน OTP หรือ Token ไม่ถูกต้อง' });
+    if (!resetDoc || !safeEqual(resetDoc.otp, String(otp).trim())) {
+      noteFail('otp:' + token);
+      return res.status(400).json({ error: 'รหัสยืนยัน OTP ไม่ถูกต้อง' });
     }
 
     if (resetDoc.used) {
@@ -2694,6 +2690,43 @@ async function logServer(type, title, details = '', meta = {}) {
     console.warn('logServer:', e.message);
   }
 }
+
+// ── ตรวจ Firebase ID token ที่มาจากการล็อกอิน Google จริง ──────────
+async function verifiedGoogleEmail(idToken) {
+  if (!idToken) return null;
+  try {
+    const d = await admin.auth().verifyIdToken(idToken);
+    const provider = d.firebase && d.firebase.sign_in_provider;
+    if (provider !== 'google.com' || d.email_verified !== true || !d.email) return null;
+    return { email: String(d.email).trim().toLowerCase(), name: d.name || '', picture: d.picture || '' };
+  } catch (e) {
+    return null;
+  }
+}
+
+// ── หลักฐานว่าผู้ใช้เพิ่งยืนยัน OTP อีเมลสำเร็จ (ใช้ครั้งเดียว อายุ 15 นาที) ──
+async function issueEmailProof(email) {
+  const proof = crypto.randomBytes(24).toString('hex');
+  await db.collection('email_link_proofs').doc(proof).set({
+    email, used: false, expiresAt: Date.now() + 15 * 60 * 1000, createdAt: new Date().toISOString()
+  });
+  return proof;
+}
+
+async function consumeEmailProof(proof) {
+  if (!proof || typeof proof !== 'string') return null;
+  const ref = db.collection('email_link_proofs').doc(proof);
+  const snap = await ref.get();
+  if (!snap.exists) return null;
+  const d = snap.data();
+  if (d.used || Date.now() > d.expiresAt) return null;
+  await ref.update({ used: true, usedAt: new Date().toISOString() });
+  return d.email;
+}
+
+// จำกัดการเดา OTP ต่อ token (6 หลัก เดาทีละคำขอได้ถ้าไม่จำกัด)
+const MAX_OTP_TRIES = 5;
+function otpLocked(token) { return tooManyFails('otp:' + token) || (failCounts.get('otp:' + token)?.count || 0) >= MAX_OTP_TRIES; }
 
 // ── นักเรียน: เข้าสู่ระบบ ─────────────────────────────────────────
 app.post('/api/auth/student', async (req, res) => {
@@ -2935,7 +2968,7 @@ app.post('/api/auth/student-link-email', async (req, res) => {
       const sDoc = await db.collection('students').doc(id).get();
       if (!sDoc.exists) return res.status(404).json({ error: 'ไม่พบข้อมูลนักเรียน' });
 
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const otpCode = crypto.randomInt(100000, 1000000).toString();
       const token = crypto.randomBytes(20).toString('hex');
       const expiresAt = Date.now() + 15 * 60 * 1000;
 
@@ -2963,21 +2996,24 @@ app.post('/api/auth/student-link-email', async (req, res) => {
       `;
 
       const sendRes = await sendSystemEmail({ to: cleanEmail, subject: emailSubject, htmlText: emailHtml });
-      const sentOk = sendRes && sendRes.sent;
+      const sentOk = sendRes && sendRes.sent && sendRes.mode !== 'sandbox' && sendRes.mode !== 'fallback';
+      if (!sentOk) {
+        await db.collection('email_login_otps').doc(token).update({ used: true, failedDelivery: true }).catch(() => {});
+        return res.status(503).json({ error: 'ส่งอีเมลไม่สำเร็จในขณะนี้ กรุณาลองใหม่ภายหลัง' });
+      }
       logServer('activity', 'นักเรียนขอผูกอีเมล (ส่ง OTP)', id + ' → ' + cleanEmail, { studentId: id });
 
       return res.json({
         ok: true, token,
-        maskedEmail: cleanEmail.replace(/(.{2})(.*)(@.*)/, '$1***$3'),
-        ...(!sentOk || sendRes.mode === 'sandbox' || sendRes.mode === 'fallback'
-          ? { previewOtp: otpCode } : {})
+        maskedEmail: cleanEmail.replace(/(.{2})(.*)(@.*)/, '$1***$3')
       });
     }
 
     if (step === 'verify') {
       if (!otpToken || !otp) return res.status(400).json({ error: 'ข้อมูล OTP ไม่ครบถ้วน' });
 
-      const otpDoc = await db.collection('email_login_otps').doc(otpToken).get();
+      if (otpLocked(otpToken)) return res.status(429).json({ error: LOCKED_MSG });
+      const otpDoc = await db.collection('email_login_otps').doc(String(otpToken)).get();
       if (!otpDoc.exists || otpDoc.data().used) {
         return res.status(400).json({ error: 'รหัส OTP หมดอายุแล้ว กรุณาขอรหัสใหม่' });
       }
@@ -2986,7 +3022,10 @@ app.post('/api/auth/student-link-email', async (req, res) => {
         return res.status(400).json({ error: 'รหัส OTP หมดอายุแล้ว กรุณาขอรหัสใหม่' });
       }
       if (otpData.studentId !== id) return res.status(400).json({ error: 'ข้อมูลไม่ตรงกัน' });
-      if (otpData.otp !== String(otp).trim()) return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้อง' });
+      if (!safeEqual(otpData.otp, String(otp).trim())) {
+        noteFail('otp:' + otpToken);
+        return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้อง' });
+      }
 
       await db.collection('email_login_otps').doc(otpToken).update({ used: true });
       const verifiedEmail = otpData.email;
@@ -3064,8 +3103,9 @@ app.post('/api/auth/magic', async (req, res) => {
     if (isNaN(elapsed) || elapsed < 0 || elapsed > 7 * 24 * 60 * 60 * 1000) {
       return res.status(401).json({ error: 'ลิงก์หมดอายุแล้ว กรุณาเข้าสู่ระบบด้วย PIN' });
     }
+    if (!SECRET_USABLE) return res.status(503).json({ error: 'ลิงก์เข้าระบบอัตโนมัติปิดใช้ชั่วคราว กรุณาเข้าสู่ระบบด้วย PIN' });
     const expected = sha256hex(`${WEBHOOK_SECRET}:${tid}:${t}:${reqId || ''}`);
-    if (expected !== sig) return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
+    if (!safeEqual(expected, sig)) return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
 
     const tDoc = await db.collection('teachers').doc(String(tid)).get();
     if (!tDoc.exists) return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครู' });
@@ -3092,7 +3132,8 @@ app.post('/api/auth/admin-magic', async (req, res) => {
     if (isNaN(elapsed) || elapsed < 0 || elapsed > 7 * 24 * 60 * 60 * 1000) {
       return res.status(401).json({ error: 'ลิงก์หมดอายุแล้ว' });
     }
-    if (sha256hex(`${WEBHOOK_SECRET}:${aid}:${at}`) !== sig) {
+    if (!SECRET_USABLE) return res.status(503).json({ error: 'ลิงก์เข้าระบบอัตโนมัติปิดใช้ชั่วคราว กรุณาเข้าสู่ระบบด้วยรหัสผ่าน' });
+    if (!safeEqual(sha256hex(`${WEBHOOK_SECRET}:${aid}:${at}`), sig)) {
       logServer('security_warn', 'ลายเซ็น Magic Link แอดมินไม่ถูกต้อง', 'พยายามเข้าระบบด้วยลิงก์ที่ลายเซ็นไม่ตรง (aid=' + aid + ')', { aid });
       return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
     }
@@ -3274,57 +3315,49 @@ app.post('/api/auth/google', async (req, res) => {
     const verifiedPicture = decoded.picture || '';
 
     // Helper functions สำหรับค้นหาผู้ใช้ตามบทบาท
-    const checkTeacher = async () => {
-      const [tSnap, tsSnap] = await Promise.all([
-        db.collection('teachers').get(),
-        db.collection('teacher_secrets').get()
+    // หา id ที่ผูกอีเมลนี้ไว้ ทั้งในเอกสารหลักและ *_secrets (ค้นด้วย where ไม่โหลดทั้ง collection)
+    const findIdByEmail = async (mainCol, secretCol) => {
+      const [a, b] = await Promise.all([
+        db.collection(mainCol).where('email', '==', verifiedEmail).limit(1).get(),
+        db.collection(secretCol).where('email', '==', verifiedEmail).limit(1).get()
       ]);
-      const tSecrets = {};
-      tsSnap.forEach(d => { tSecrets[d.id] = d.data(); });
-      let matched = null;
-      tSnap.forEach(doc => {
-        const d = doc.data();
-        const sec = tSecrets[doc.id] || {};
-        const mail = String(sec.email || d.email || '').trim().toLowerCase();
-        if (mail && mail === verifiedEmail) {
-          matched = { id: doc.id, name: d.name || '', department: d.department || '', email: verifiedEmail };
-        }
-      });
-      return matched;
+      if (!a.empty) return a.docs[0].id;
+      if (!b.empty) return b.docs[0].id;
+      return null;
+    };
+
+    const checkTeacher = async () => {
+      const id = await findIdByEmail('teachers', 'teacher_secrets');
+      if (!id) return null;
+      const doc = await db.collection('teachers').doc(id).get();
+      if (!doc.exists) return null;
+      const d = doc.data();
+      return { id, name: d.name || '', department: d.department || '', email: verifiedEmail };
     };
 
     const checkStudent = async () => {
-      const [sSnap, ssSnap] = await Promise.all([
-        db.collection('students').get(),
-        db.collection('student_secrets').get()
-      ]);
-      const sSecrets = {};
-      ssSnap.forEach(d => { sSecrets[d.id] = d.data(); });
-      let matched = null;
-      sSnap.forEach(doc => {
-        const d = doc.data();
-        const sec = sSecrets[doc.id] || {};
-        const mail = String(sec.email || d.email || '').trim().toLowerCase();
-        if (mail && mail === verifiedEmail) {
-          matched = { id: doc.id, name: d.name || '', studentClass: d.studentClass || d.class || '', studentNo: d.studentNo || '', email: verifiedEmail };
-        }
-      });
-      return matched;
+      const id = await findIdByEmail('students', 'student_secrets');
+      if (!id) return null;
+      const doc = await db.collection('students').doc(id).get();
+      if (!doc.exists) return null;
+      const d = doc.data();
+      return { id, name: d.name || '', studentClass: d.studentClass || d.class || '', studentNo: d.studentNo || '', email: verifiedEmail };
     };
 
     const checkStaff = async () => {
-      const SUPER_ADMIN_EMAILS = ['sirachut25432@gmail.com'];
+      const SUPER_ADMIN_EMAILS = String(process.env.SUPER_ADMIN_EMAILS || 'sirachut25432@gmail.com')
+        .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
       let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
-      const staffSnap = await db.collection('admin_users').get();
+      const staffSnap = await db.collection('admin_users').where('email', '==', verifiedEmail).limit(1).get();
       let matchedStaff = null;
-      staffSnap.forEach(doc => {
+      if (!staffSnap.empty) {
+        const doc = staffSnap.docs[0];
         const d = doc.data();
-        const mail = String(d.email || '').trim().toLowerCase();
-        if (mail && mail === verifiedEmail) {
+        if (d.isActive !== false) {
           matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', role: d.role, email: verifiedEmail };
           if (d.role === 'super' || doc.id === 'super') isSuperAdmin = true;
         }
-      });
+      }
       return { isSuperAdmin, matchedStaff };
     };
 
@@ -3445,11 +3478,19 @@ app.post('/api/auth/google', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 const handleLinkAccount = async (req, res) => {
   try {
-    const { email, role, identifier, teacherId: reqTeacherId, phone: reqPhone, pin, name, studentClass, studentNo, isNewStudent } = req.body || {};
-    const cleanEmail = String(email || '').trim().toLowerCase();
+    const { idToken, linkProof, role, identifier, teacherId: reqTeacherId, phone: reqPhone, pin, name, studentClass, studentNo, isNewStudent } = req.body || {};
     const cleanId = String(identifier || '').trim();
-    if (!cleanEmail || !role || (!cleanId && !reqTeacherId) || !isPin(pin)) {
+    if (!role || (!cleanId && !reqTeacherId) || !isPin(pin)) {
       return res.status(400).json({ error: 'กรุณากรอกข้อมูลและ PIN 4 หลักให้ครบถ้วน' });
+    }
+
+    // อีเมลที่จะผูกต้องพิสูจน์ได้ว่าเป็นของผู้ขอจริง — ห้ามเชื่ออีเมลใน body
+    let cleanEmail = '';
+    const g = await verifiedGoogleEmail(idToken);
+    if (g) cleanEmail = g.email;
+    else if (linkProof) cleanEmail = (await consumeEmailProof(linkProof)) || '';
+    if (!cleanEmail) {
+      return res.status(401).json({ error: 'ยืนยันอีเมลไม่สำเร็จหรือหมดอายุ กรุณาเข้าสู่ระบบด้วย Google หรือขอ OTP ใหม่' });
     }
 
     if (role === 'teacher') {
@@ -3484,7 +3525,7 @@ const handleLinkAccount = async (req, res) => {
       const expected = stored || DEFAULT_TEACHER_PIN;
       if (expected !== pin) {
         noteFail(key);
-        return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง (รหัสเริ่มต้นคือ 2026)' });
+        return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
       }
       clearFails(key);
 
@@ -3529,10 +3570,13 @@ const handleLinkAccount = async (req, res) => {
           return res.status(400).json({ error: 'กรุณาระบุเลขที่นักเรียน' });
         }
 
-        // หากมีรหัสนี้อยู่แล้ว ตรวจสอบว่า PIN ตรงกันหรือไม่
+        // หากมีรหัสนี้อยู่แล้ว ตรวจสอบว่า PIN ตรงกันหรือไม่ (นับครั้งผิด กันไล่เดา PIN)
         if (sDoc.exists) {
+          const nkey = 'stu:' + sid;
+          if (tooManyFails(nkey)) return res.status(429).json({ error: LOCKED_MSG });
           const storedPin = await studentSecret(sid, 'pin');
           if (storedPin && storedPin !== pin) {
+            noteFail(nkey);
             return res.status(409).json({ error: 'รหัสนักเรียนนี้มีอยู่ในระบบแล้ว กรุณาเข้าสู่ระบบด้วย PIN เดิม หรือกู้คืนรหัสผ่าน' });
           }
         }
@@ -3608,7 +3652,10 @@ app.post('/api/auth/request-email-otp', async (req, res) => {
       return res.status(400).json({ error: 'กรุณาระบุที่อยู่อีเมลที่ถูกต้อง' });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    if (tooManyFails('otpreq:' + cleanEmail)) return res.status(429).json({ error: LOCKED_MSG });
+    noteFail('otpreq:' + cleanEmail);
+
+    const otp = crypto.randomInt(100000, 1000000).toString();
     const token = crypto.randomBytes(20).toString('hex');
     const expiresAt = Date.now() + 15 * 60 * 1000;
 
@@ -3641,16 +3688,13 @@ app.post('/api/auth/request-email-otp', async (req, res) => {
       htmlText: emailHtml
     });
 
-    const sentOk = sendRes && sendRes.sent;
-    return res.json({
-      ok: true,
-      email: cleanEmail,
-      token,
-      expiresAt,
-      ...(!sentOk || sendRes.mode === 'sandbox' || sendRes.mode === 'fallback'
-        ? { previewOtp: otp, isFallback: !sentOk }
-        : {})
-    });
+    const sentOk = sendRes && sendRes.sent && sendRes.mode !== 'sandbox' && sendRes.mode !== 'fallback';
+    if (!sentOk) {
+      await db.collection('email_login_otps').doc(token).update({ used: true, failedDelivery: true }).catch(() => {});
+      return res.status(503).json({ error: 'ส่งอีเมลไม่สำเร็จในขณะนี้ กรุณาเข้าสู่ระบบด้วย PIN หรือ LINE' });
+    }
+    // ห้ามคืน OTP ในคำตอบ — ไม่งั้นใครรู้อีเมลแอดมินก็ได้รหัสเข้าระบบทันที
+    return res.json({ ok: true, email: cleanEmail, token, expiresAt });
   } catch (err) {
     console.error('request-email-otp error:', err);
     res.status(500).json({ error: err.message });
@@ -3666,35 +3710,22 @@ app.post('/api/auth/verify-email-otp', async (req, res) => {
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanOtp = String(otp || '').trim();
 
-    if (!cleanOtp || (!token && !cleanEmail)) {
-      return res.status(400).json({ error: 'กรุณาระบุรหัส OTP และอีเมลให้ครบถ้วน' });
+    if (!cleanOtp || !token) {
+      return res.status(400).json({ error: 'กรุณาระบุรหัส OTP ให้ครบถ้วน' });
     }
+    if (otpLocked(token)) return res.status(429).json({ error: LOCKED_MSG });
 
     let otpDoc = null;
     let otpDocId = null;
-
-    if (token) {
-      const snap = await db.collection('email_login_otps').doc(token).get();
-      if (snap.exists) {
-        otpDoc = snap.data();
-        otpDocId = snap.id;
-      }
+    const snap = await db.collection('email_login_otps').doc(String(token)).get();
+    if (snap.exists) {
+      otpDoc = snap.data();
+      otpDocId = snap.id;
     }
 
-    if (!otpDoc && cleanEmail) {
-      const q = await db.collection('email_login_otps')
-        .where('email', '==', cleanEmail)
-        .where('otp', '==', cleanOtp)
-        .where('used', '==', false)
-        .limit(1)
-        .get();
-      if (!q.empty) {
-        otpDoc = q.docs[0].data();
-        otpDocId = q.docs[0].id;
-      }
-    }
-
-    if (!otpDoc || otpDoc.used || otpDoc.otp !== cleanOtp) {
+    // OTP สำหรับผูกอีเมลนักเรียน ห้ามนำมาใช้ล็อกอิน
+    if (!otpDoc || otpDoc.used || otpDoc.purpose === 'link_email' || !safeEqual(otpDoc.otp, cleanOtp)) {
+      noteFail('otp:' + token);
       return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้องหรือถูกใช้งานไปแล้ว' });
     }
 
@@ -3785,11 +3816,13 @@ app.post('/api/auth/verify-email-otp', async (req, res) => {
       });
     }
 
-    // หากยังไม่เคยผูกข้อมูลในระบบ ให้ส่ง needLink เพื่อนำเข้าหน้ากรอกข้อมูลพื้นฐาน
+    // หากยังไม่เคยผูกข้อมูลในระบบ ให้ส่ง needLink พร้อมหลักฐานยืนยันอีเมล
+    // (หน้าผูกบัญชีต้องส่งหลักฐานนี้กลับมา จะอ้างอีเมลเอาเองไม่ได้)
     return res.json({
       ok: false,
       needLink: true,
-      email: verifiedEmail
+      email: verifiedEmail,
+      linkProof: await issueEmailProof(verifiedEmail)
     });
   } catch (err) {
     console.error('verify-email-otp error:', err);
@@ -3807,6 +3840,13 @@ app.post('/api/auth/unlink-account', async (req, res) => {
     if (!role || !targetId) {
       return res.status(400).json({ error: 'กรุณาระบุประเภทบัญชีและรหัสประจำตัว' });
     }
+
+    // เดิมไม่มีการตรวจสิทธิ์เลย — ใครก็ปลดอีเมลของใครก็ได้
+    const c = await callerClaims(req);
+    const isAdminCaller = c && (c.role === 'admin' || c.role === 'staff');
+    const isSelf = c && ((role === 'teacher' && c.role === 'teacher' && c.tid === targetId)
+      || (role === 'student' && c.role === 'student' && c.sid === targetId));
+    if (!isAdminCaller && !isSelf) return res.status(403).json({ error: 'ไม่มีสิทธิ์ดำเนินการ' });
 
     if (role === 'teacher') {
       await Promise.all([
@@ -3884,7 +3924,7 @@ app.post('/api/auth/request-line-otp', async (req, res) => {
       });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = crypto.randomInt(100000, 1000000).toString();
     const token = crypto.randomBytes(20).toString('hex');
     const expiresAt = Date.now() + 5 * 60 * 1000; // 5 นาที
 
@@ -3947,13 +3987,17 @@ app.post('/api/auth/verify-line-otp', async (req, res) => {
     const { token, otp } = req.body || {};
     if (!token || !otp) return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
 
-    const snap = await db.collection('line_otps').doc(token).get();
+    if (otpLocked(token)) return res.status(429).json({ error: LOCKED_MSG });
+    const snap = await db.collection('line_otps').doc(String(token)).get();
     if (!snap.exists) return res.status(400).json({ error: 'คำขอนี้ไม่ถูกต้องหรือหมดอายุ' });
 
     const data = snap.data();
     if (data.used) return res.status(400).json({ error: 'รหัสนี้ถูกใช้งานไปแล้ว' });
     if (Date.now() > data.expiresAt) return res.status(400).json({ error: 'รหัส OTP หมดอายุแล้ว' });
-    if (data.otp !== String(otp).trim()) return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้อง' });
+    if (!safeEqual(data.otp, String(otp).trim())) {
+      noteFail('otp:' + token);
+      return res.status(400).json({ error: 'รหัส OTP ไม่ถูกต้อง' });
+    }
 
     await db.collection('line_otps').doc(token).update({ used: true, usedAt: new Date().toISOString() });
 
@@ -3994,7 +4038,10 @@ app.get('/', (req, res) => {
 });
 
 // ── Realtime Logs for Debugging ──────────────────────────────────
-app.get('/logs', (req, res) => {
+app.get('/logs', async (req, res) => {
+  // log ดีบักมีอีเมลและข้อความจาก LINE — เปิดให้เฉพาะแอดมิน
+  const c = await callerClaims(req);
+  if (!c || c.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
   res.json({
     count: recentLogs.length,
     firebaseConnected: !!db,
