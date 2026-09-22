@@ -663,6 +663,9 @@ async function handleLineEvent(event) {
           auditLogs: updatedLogs
         });
 
+        // ซิงค์สถานะ defective_records
+        syncDefectiveRecordFromRequest({ ...reqData, id: reqId, status: 'teacher_approved', newGrade: grade });
+
         // แจ้งฝ่ายวัดผล: ปกติส่งเป็น "สรุปรวบยอด" ไม่ยิงทีละคน
         // ถ้ามีนักเรียนแก้เกรดเป็นร้อย ฝ่ายวัดผลจะได้ข้อความเดียวต่อรอบ
         // ยกเว้นการแก้เกรดที่อนุมัติไปแล้ว ซึ่งต้องรู้ทันที
@@ -2056,6 +2059,33 @@ async function notifyStaffGradeChanged(reqData, oldGrade, newGrade, teacherName)
   }
 }
 
+// ── ซิงค์สถานะผลการเรียนบกพร่อง (defective_records) ───────────────
+async function syncDefectiveRecordFromRequest(reqData) {
+  if (!db || !reqData || !reqData.studentId) return;
+  try {
+    const sId = String(reqData.studentId).trim();
+    const sem = reqData.semester || '';
+    const parts = sem.split('/');
+    const term = parts[0] || '';
+    const year = parts[1] || '';
+    const safeCode = (reqData.subjectCode || 'UNKNOWN').replace(/[\/\s]/g, '_');
+    const docId = `${sId}_${safeCode}_${term}_${year}`;
+
+    const update = {
+      status: reqData.status || 'pending_teacher',
+      requestId: reqData.id || null,
+      updatedAt: new Date().toISOString()
+    };
+    if (reqData.newGrade) update.newGrade = reqData.newGrade;
+    if (['teacher_approved', 'completed'].includes(reqData.status)) {
+      update.resolvedAt = new Date().toISOString();
+    }
+    await db.collection('defective_records').doc(docId).set(update, { merge: true });
+  } catch (e) {
+    console.error('syncDefectiveRecordFromRequest error:', e.message);
+  }
+}
+
 // ── ตรวจผู้เรียกจาก Firebase ID token (Authorization: Bearer ...) ──
 //    แทน shared secret เดิมที่เคยฝังอยู่ในหน้าเว็บ
 async function callerClaims(req) {
@@ -2109,6 +2139,9 @@ app.post('/notify-teacher', async (req, res) => {
       if (!allowed) return res.status(403).json({ error: 'Forbidden' });
     }
 
+    // ซิงค์สถานะ defective_records อัตโนมัติ
+    syncDefectiveRecordFromRequest({ ...reqData, id: reqId });
+
     const teacherDoc = await db.collection('teachers').doc(teacherId).get();
     if (!teacherDoc.exists) return res.status(404).json({ error: 'Teacher not found' });
 
@@ -2160,6 +2193,9 @@ app.post('/notify-student', async (req, res) => {
         || c.role === 'admin' || c.role === 'staff';
       if (!allowed) return res.status(403).json({ error: 'Forbidden' });
     }
+
+    // ซิงค์สถานะ defective_records
+    syncDefectiveRecordFromRequest({ ...reqData, id: body.id || reqSnap.id });
 
     const studentDoc = await db.collection('students').doc(studentId).get();
     if (!studentDoc.exists) return res.json({ sent: false, reason: 'Student not found' });
@@ -4330,6 +4366,362 @@ app.post('/api/auth/line-register', async (req, res) => {
     }
   } catch (err) {
     console.error('auth/line-register error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ── DEFECTIVE GRADE RECORDS (SGS IMPORT & SYNC) APIs ─────────────
+// ════════════════════════════════════════════════════════════════
+
+// API: ดึงรายวิชาที่ติด 0, ร, มส, มผ ของนักเรียน (พร้อมสถานะ realtime)
+async function handleStudentDefects(req, res) {
+  try {
+    const studentId = String(req.params.studentId || req.body.studentId || req.query.studentId || '').trim();
+    if (!studentId) return res.status(400).json({ error: 'กรุณาระบุรหัสนักเรียน (studentId)' });
+
+    // ตรวจสิทธิ์: ถ้าเป็นนักเรียน ต้องเป็น studentId ของตัวเอง
+    const c = await callerClaims(req);
+    if (c && c.role === 'student' && String(c.sid) !== studentId) {
+      return res.status(403).json({ error: 'ไม่มีสิทธิ์เข้าถึงข้อมูลของนักเรียนคนอื่น' });
+    }
+
+    if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+
+    const [snap, reqSnap] = await Promise.all([
+      db.collection('defective_records').where('studentId', '==', studentId).get(),
+      db.collection('requests').where('studentId', '==', studentId).get()
+    ]);
+
+    const reqMap = new Map();
+    reqSnap.forEach(d => {
+      const data = d.data();
+      const code = (data.subjectCode || '').replace(/\s+/g, '').toUpperCase();
+      const sem = data.semester || '';
+      reqMap.set(`${code}_${sem}`, { id: d.id, ...data });
+      if (data.subjectName) {
+        reqMap.set(`${data.subjectName.trim()}_${sem}`, { id: d.id, ...data });
+      }
+    });
+
+    const records = [];
+    snap.forEach(doc => {
+      const r = doc.data();
+      const code = (r.subjectCode || '').replace(/\s+/g, '').toUpperCase();
+      const sem = r.semester || `${r.term}/${r.year}`;
+      const matched = reqMap.get(`${code}_${sem}`) || (r.subjectName ? reqMap.get(`${r.subjectName.trim()}_${sem}`) : null);
+
+      if (matched) {
+        r.status = matched.status || r.status;
+        r.requestId = matched.id;
+        r.newGrade = matched.newGrade || r.newGrade;
+        r.resolvedAt = matched.completedAt || matched.updatedAt || r.resolvedAt;
+      }
+      records.push({ id: doc.id, ...r });
+    });
+
+    // เรียงตามปีและภาคเรียน ล่าสุดขึ้นก่อน
+    records.sort((a, b) => {
+      const semA = `${a.year || ''}_${a.term || ''}`;
+      const semB = `${b.year || ''}_${b.term || ''}`;
+      return semB.localeCompare(semA);
+    });
+
+    res.json({ ok: true, studentId, count: records.length, records });
+  } catch (err) {
+    console.error('api/student-defects error:', err);
+    res.status(500).json({ error: err.message });
+  }
+}
+app.get('/api/student-defects/:studentId', handleStudentDefects);
+app.get('/api/student-defects', handleStudentDefects);
+app.post('/api/student-defects', handleStudentDefects);
+
+// API: บัญชีนักเรียนที่ติด 0, ร, มส, มผ ในวิชาของครู
+async function handleTeacherDefectiveRoster(req, res) {
+  try {
+    const teacherId = String(req.query.teacherId || req.body.teacherId || '').trim();
+    let teacherName = String(req.query.teacherName || req.body.teacherName || '').trim();
+    const semester = String(req.query.semester || req.body.semester || '').trim();
+    const gradeType = String(req.query.gradeType || req.body.gradeType || '').trim();
+    const studentClass = String(req.query.studentClass || req.body.studentClass || '').trim();
+    const status = String(req.query.status || req.body.status || '').trim();
+    const search = String(req.query.search || req.body.search || '').trim().toLowerCase();
+
+    if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+
+    if (teacherId && !teacherName) {
+      const tDoc = await db.collection('teachers').doc(teacherId).get();
+      if (tDoc.exists) {
+        teacherName = tDoc.data().name || '';
+      }
+    }
+
+    let records = [];
+    const seen = new Set();
+
+    if (teacherId || teacherName) {
+      const promises = [];
+      if (teacherId) {
+        promises.push(db.collection('defective_records').where('teacherId', '==', teacherId).get());
+      }
+      if (teacherName) {
+        const cleanTName = teacherName.replace(/\s+/g, ' ').trim();
+        promises.push(db.collection('defective_records').where('teacherNames', 'array-contains', cleanTName).get());
+        const stripped = cleanTName.replace(/^(นาย|นางสาว|นาง|ว่าที่ร้อยตรี|ว่าที่ ร\.ต\.|ดร\.|ครู)\s*/, '');
+        if (stripped && stripped !== cleanTName) {
+          promises.push(db.collection('defective_records').where('teacherNames', 'array-contains', stripped).get());
+        }
+      }
+
+      const snapshots = await Promise.all(promises);
+      for (const snap of snapshots) {
+        snap.forEach(doc => {
+          if (!seen.has(doc.id)) {
+            seen.add(doc.id);
+            records.push({ id: doc.id, ...doc.data() });
+          }
+        });
+      }
+    } else {
+      // แอดมินหรือกรณีไม่ระบุครู
+      const snap = await db.collection('defective_records').limit(3000).get();
+      snap.forEach(doc => {
+        if (!seen.has(doc.id)) {
+          seen.add(doc.id);
+          records.push({ id: doc.id, ...doc.data() });
+        }
+      });
+    }
+
+    // กรองเพิ่มเติม
+    if (semester && semester !== 'all') {
+      records = records.filter(r => r.semester === semester);
+    }
+    if (gradeType && gradeType !== 'all') {
+      records = records.filter(r => r.gradeType === gradeType);
+    }
+    if (studentClass && studentClass !== 'all') {
+      records = records.filter(r => (r.studentClass || '').startsWith(studentClass));
+    }
+    if (status && status !== 'all') {
+      records = records.filter(r => r.status === status);
+    }
+    if (search) {
+      records = records.filter(r => 
+        (r.studentId && r.studentId.toLowerCase().includes(search)) ||
+        (r.studentName && r.studentName.toLowerCase().includes(search)) ||
+        (r.subjectCode && r.subjectCode.toLowerCase().includes(search)) ||
+        (r.subjectName && r.subjectName.toLowerCase().includes(search)) ||
+        (r.studentClass && r.studentClass.toLowerCase().includes(search))
+      );
+    }
+
+    // สถิติภาพรวม
+    const stats = {
+      total: records.length,
+      unsubmitted: records.filter(r => r.status === 'unsubmitted').length,
+      pending: records.filter(r => ['pending_teacher', 'assigned_work'].includes(r.status)).length,
+      completed: records.filter(r => ['teacher_approved', 'completed'].includes(r.status)).length,
+      byGrade: {
+        '0': records.filter(r => r.gradeType === '0').length,
+        'ร': records.filter(r => r.gradeType === 'ร').length,
+        'มส': records.filter(r => r.gradeType === 'มส').length,
+        'มผ': records.filter(r => r.gradeType === 'มผ').length
+      }
+    };
+
+    // เรียงตาม: ระดับชั้น/ห้อง -> เลขที่ -> รหัสนักเรียน
+    records.sort((a, b) => {
+      const cls = (a.studentClass || '').localeCompare(b.studentClass || '');
+      if (cls !== 0) return cls;
+      const noA = parseInt(a.studentNo || '999', 10);
+      const noB = parseInt(b.studentNo || '999', 10);
+      return noA - noB;
+    });
+
+    res.json({ ok: true, stats, count: records.length, records });
+  } catch (err) {
+    console.error('api/teacher-defective-roster error:', err);
+    res.status(500).json({ error: err.message });
+  }
+}
+app.get('/api/teacher-defective-roster', handleTeacherDefectiveRoster);
+app.post('/api/teacher-defective-roster', handleTeacherDefectiveRoster);
+
+// API: อัปเดตข้อมูล record ผลการเรียนบกพร่องโดยตรง
+app.post('/api/sync-defective-record', async (req, res) => {
+  try {
+    const { studentId, subjectCode, term, year, status, requestId, newGrade } = req.body;
+    if (!studentId || !subjectCode) {
+      return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    const safeCode = (subjectCode || '').replace(/[\/\s]/g, '_');
+    const docId = `${studentId}_${safeCode}_${term}_${year}`;
+
+    const updateData = {
+      status: status || 'pending_teacher',
+      updatedAt: new Date().toISOString()
+    };
+    if (requestId) updateData.requestId = requestId;
+    if (newGrade) updateData.newGrade = newGrade;
+    if (['teacher_approved', 'completed'].includes(status)) {
+      updateData.resolvedAt = new Date().toISOString();
+    }
+
+    await db.collection('defective_records').doc(docId).set(updateData, { merge: true });
+    res.json({ ok: true, docId });
+  } catch (err) {
+    console.error('api/sync-defective-record error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: แอดมินนำเข้าข้อมูล SGS แบบกลุ่ม (จากหน้าเว็บแอดมิน)
+app.post('/api/admin/batch-import-defects', async (req, res) => {
+  try {
+    const c = await callerClaims(req);
+    if (!c || (c.role !== 'admin' && c.role !== 'staff')) {
+      return res.status(403).json({ error: 'เฉพาะผู้ดูแลระบบและฝ่ายวัดผลเท่านั้น' });
+    }
+
+    const { records, students } = req.body;
+    if (!records || !Array.isArray(records)) {
+      return res.status(400).json({ error: 'ไม่พบรายการข้อมูลที่ส่งมา' });
+    }
+
+    if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+
+    // ดึงรายชื่อครูทั้งหมดมาจับคู่ ID อัตโนมัติ
+    const teachersSnap = await db.collection('teachers').get();
+    const teacherMap = new Map();
+    teachersSnap.forEach(doc => {
+      const d = doc.data();
+      if (d.name) {
+        const clean = d.name.replace(/\s+/g, ' ').trim();
+        teacherMap.set(clean, doc.id);
+        const stripped = clean.replace(/^(นาย|นางสาว|นาง|ว่าที่ร้อยตรี|ว่าที่ ร\.ต\.|ดร\.|ครู)\s*/, '');
+        if (stripped) teacherMap.set(stripped, doc.id);
+      }
+    });
+
+    // ดึงคำร้องที่มีอยู่มาเชื่อมโยงสถานะ
+    const reqSnap = await db.collection('requests').get();
+    const reqMap = new Map();
+    reqSnap.forEach(doc => {
+      const d = doc.data();
+      if (d.studentId && d.semester) {
+        const sCode = (d.subjectCode || '').replace(/\s+/g, '').toUpperCase();
+        reqMap.set(`${d.studentId}_${sCode}_${d.semester}`, { id: doc.id, ...d });
+        if (d.subjectName) {
+          reqMap.set(`${d.studentId}_${d.subjectName.trim()}_${d.semester}`, { id: doc.id, ...d });
+        }
+      }
+    });
+
+    let recordsSaved = 0;
+    let studentsSaved = 0;
+
+    // 1. นำเข้า defective_records เป็นชุดละ 400
+    for (let i = 0; i < records.length; i += 400) {
+      const batch = db.batch();
+      const chunk = records.slice(i, i + 400);
+
+      for (const r of chunk) {
+        if (!r.studentId || !r.subjectCode) continue;
+
+        const term = String(r.term || '1');
+        const year = String(r.year || '2568');
+        const safeCode = (r.subjectCode || 'UNKNOWN').replace(/[\/\s]/g, '_');
+        const docId = `${r.studentId}_${safeCode}_${term}_${year}`;
+        const sem = r.semester || `${term}/${year}`;
+
+        // ตรวจสอบคำร้องที่มีอยู่
+        const sCode = (r.subjectCode || '').replace(/\s+/g, '').toUpperCase();
+        const matchedReq = reqMap.get(`${r.studentId}_${sCode}_${sem}`) || (r.subjectName ? reqMap.get(`${r.studentId}_${r.subjectName.trim()}_${sem}`) : null);
+
+        let status = r.status || 'unsubmitted';
+        let requestId = r.requestId || null;
+        let newGrade = r.newGrade || null;
+        let resolvedAt = r.resolvedAt || null;
+
+        if (matchedReq) {
+          status = matchedReq.status || status;
+          requestId = matchedReq.id;
+          newGrade = matchedReq.newGrade || newGrade;
+          resolvedAt = matchedReq.completedAt || matchedReq.updatedAt || resolvedAt;
+        }
+
+        // จับคู่ teacherId
+        let teacherId = r.teacherId || null;
+        if (!teacherId && r.teacherName) {
+          const tClean = r.teacherName.replace(/\s+/g, ' ').trim();
+          teacherId = teacherMap.get(tClean) || teacherMap.get(tClean.replace(/^(นาย|นางสาว|นาง|ว่าที่ร้อยตรี|ว่าที่ ร\.ต\.|ดร\.|ครู)\s*/, '')) || null;
+        }
+
+        const docRef = db.collection('defective_records').doc(docId);
+        batch.set(docRef, {
+          id: docId,
+          studentId: String(r.studentId).trim(),
+          studentName: r.studentName || '',
+          studentClass: r.studentClass || '',
+          studentNo: String(r.studentNo || ''),
+          subjectCode: r.subjectCode || '',
+          subjectName: r.subjectName || '',
+          credit: String(r.credit || '1.0'),
+          gradeType: r.gradeType || '',
+          semester: sem,
+          term,
+          year,
+          teacherName: r.teacherName || '',
+          teacherNames: r.teacherNames || (r.teacherName ? [r.teacherName] : []),
+          teacherId,
+          rawTeacher: r.rawTeacher || '',
+          status,
+          requestId,
+          newGrade,
+          resolvedAt,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+
+        recordsSaved++;
+      }
+      await batch.commit();
+    }
+
+    // 2. นำเข้า/อัปเดตข้อมูลนักเรียน (ถ้ามี)
+    if (students && Array.isArray(students) && students.length > 0) {
+      for (let i = 0; i < students.length; i += 400) {
+        const batch = db.batch();
+        const chunk = students.slice(i, i + 400);
+        for (const s of chunk) {
+          const sId = String(s.id || s.studentId || '').trim();
+          if (!sId) continue;
+          const sRef = db.collection('students').doc(sId);
+          batch.set(sRef, {
+            id: sId,
+            name: s.name || s.studentName || '',
+            studentClass: s.studentClass || s.class || '',
+            studentNo: String(s.studentNo || ''),
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+          studentsSaved++;
+        }
+        await batch.commit();
+      }
+    }
+
+    logServer('activity', 'แอดมินนำเข้าข้อมูล SGS สำเร็จ', `บันทึกผลการเรียนบกพร่อง ${recordsSaved} รายการ, นักเรียน ${studentsSaved} คน โดย ${c.name || c.email || 'Admin'}`);
+
+    res.json({
+      ok: true,
+      recordsSaved,
+      studentsSaved,
+      message: `นำเข้าข้อมูล SGS สำเร็จ ${recordsSaved} รายการ`
+    });
+  } catch (err) {
+    console.error('api/admin/batch-import-defects error:', err);
     res.status(500).json({ error: err.message });
   }
 });
