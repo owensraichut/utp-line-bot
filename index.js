@@ -103,6 +103,15 @@ function generateMagicLink(teacherId, requestId = '') {
   return `${BASE_URL}/?page=teacher-verify&tid=${encodeURIComponent(teacherId)}&t=${timestamp}&sig=${sig}&req=${encodeURIComponent(requestId)}`;
 }
 
+function generateLineMagicLink(lineUserId, displayName = '', pictureUrl = '') {
+  const timestamp = Date.now();
+  const raw = `${WEBHOOK_SECRET}:${lineUserId}:${timestamp}`;
+  const sig = crypto.createHash('sha256').update(raw).digest('hex');
+  const dName = encodeURIComponent(displayName || '');
+  const pUrl = encodeURIComponent(pictureUrl || '');
+  return `${BASE_URL}/?page=line-auth&luid=${encodeURIComponent(lineUserId)}&lt=${timestamp}&lsig=${sig}&ldn=${dName}&lpic=${pUrl}`;
+}
+
 // ── Helper: ส่ง LINE Push Message ──────────────────────────────
 async function sendLineFlexMessage(lineUserId, altText, flexContents) {
   if (!LINE_TOKEN) { console.error('No LINE token'); return; }
@@ -345,21 +354,29 @@ function buildMainMenuFlex(userId, userState = {}) {
       type: 'button', style: 'primary', color: '#1976D2', height: 'sm',
       action: { type: 'message', label: '📊 เช็คผลการเรียน (นักเรียน)', text: 'เช็คเกรด' }
     });
+    menuButtons.push({
+      type: 'button', style: 'secondary', height: 'sm',
+      action: {
+        type: 'uri',
+        label: '🌐 เข้าห้องเรียนดิจิทัล (Auto-Login)',
+        uri: generateLineMagicLink(userId, linkedStudent.name || '')
+      }
+    });
   }
 
   // Fallback if not linked
   if (!linkedTeacher && !isSuperAdmin && !linkedStaff && !linkedStudent) {
     menuButtons.push({
-      type: 'button', style: 'primary', color: '#0B6623', height: 'sm',
-      action: { type: 'message', label: '🟢 วิธีผูกบัญชีครู', text: 'วิธีผูกบัญชี' }
+      type: 'button', style: 'primary', color: '#06C755', height: 'sm',
+      action: {
+        type: 'uri',
+        label: '🟢 เข้าสู่ระบบ / ผูกบัญชี LINE (แตะเลย)',
+        uri: generateLineMagicLink(userId)
+      }
     });
     menuButtons.push({
       type: 'button', style: 'secondary', height: 'sm',
-      action: { type: 'message', label: '🔵 วิธีผูกบัญชีนักเรียน', text: 'วิธีผูกบัญชี' }
-    });
-    menuButtons.push({
-      type: 'button', style: 'secondary', height: 'sm',
-      action: { type: 'message', label: '🛡️ วิธีผูกบัญชีแอดมิน/วัดผล', text: 'วิธีผูกบัญชี' }
+      action: { type: 'message', label: '📖 ดูวิธีผูกบัญชีด้วยการพิมพ์', text: 'วิธีผูกบัญชี' }
     });
   } else {
     menuButtons.push({
@@ -466,8 +483,8 @@ async function handleLineEvent(event) {
       footer: {
         type: 'box', layout: 'vertical', paddingAll: '12px', spacing: 'sm',
         contents: [
-          { type: 'button', style: 'primary', color: '#0B6623', height: 'sm', action: { type: 'message', label: '📱 เปิดเมนูหลัก', text: 'เมนู' } },
-          { type: 'button', style: 'secondary', height: 'sm', action: { type: 'uri', label: '🌐 เข้าเว็บไซต์หลัก', uri: BASE_URL } }
+          { type: 'button', style: 'primary', color: '#06C755', height: 'sm', action: { type: 'uri', label: '🟢 เข้าสู่ระบบ / ผูกบัญชี LINE ทันที', uri: generateLineMagicLink(userId) } },
+          { type: 'button', style: 'secondary', height: 'sm', action: { type: 'message', label: '📱 เปิดเมนูหลัก', text: 'เมนู' } }
         ]
       }
     };
@@ -1861,10 +1878,30 @@ async function handleLineEvent(event) {
 
     // F: วิธีผูกบัญชี
     if (text === 'วิธีผูกบัญชี' || text === 'วิธีใช้งาน' || text === 'ผูกบัญชี') {
-      await sendLineReply(event.replyToken, [{
-        type: 'text',
-        text: `📱 วิธีผูกบัญชีกับ UTP Smart\n\n🟢 สำหรับคุณครู (ปลอดภัยด้วย PIN):\nพิมพ์: ครู [ชื่อ] [PIN 4 หลัก]\nตัวอย่าง: ครู สมชาย 1234\n\n🔵 สำหรับนักเรียน (PDPA ป้องกันแอบดูเกรด):\nพิมพ์: นักเรียน [รหัส 5 หลัก] [PIN 4 หลัก]\nตัวอย่าง: นักเรียน 12345 1234\n(หรือพิมพ์ "นักเรียน 12345" แล้วรอระบบถาม PIN ครับ)\n\nเมื่อผูกแล้ว ระบบจะแจ้งเตือนเมื่อครูอนุมัติเกรด/สั่งงาน และเช็คผลการแก้ตัวได้ตลอด 24 ชม. ครับ!`
-      }]);
+      const linkUrl = generateLineMagicLink(userId);
+      const linkFlex = {
+        type: 'bubble', size: 'kilo',
+        header: {
+          type: 'box', layout: 'vertical', backgroundColor: '#06C755', paddingAll: '12px',
+          contents: [{ type: 'text', text: '📱 ผูกบัญชีผ่าน LINE ง่ายที่สุด', color: '#FFFFFF', weight: 'bold', size: 'sm' }]
+        },
+        body: {
+          type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px',
+          contents: [
+            { type: 'text', text: 'แตะปุ่มด้านล่างเพื่อเข้าสู่ระบบหรือลงทะเบียนผูก LINE ได้ในคลิกเดียว!', size: 'xs', color: '#333333', wrap: true },
+            { type: 'separator', margin: 'sm' },
+            { type: 'text', text: 'หรือพิมพ์ในแชตนี้:', size: 'xxs', color: '#888888' },
+            { type: 'text', text: '• ครู: ครู [ชื่อ] [PIN]\n• นักเรียน: นักเรียน [รหัส 5 หลัก] [PIN]', size: 'xxs', color: '#555555', wrap: true }
+          ]
+        },
+        footer: {
+          type: 'box', layout: 'vertical', paddingAll: '10px',
+          contents: [
+            { type: 'button', style: 'primary', color: '#06C755', height: 'sm', action: { type: 'uri', label: '🟢 แตะผูกบัญชี LINE ทันที', uri: linkUrl } }
+          ]
+        }
+      };
+      await sendLineReply(event.replyToken, [{ type: 'flex', altText: 'ผูกบัญชี UTP Smart', contents: linkFlex }]);
       return;
     }
 
@@ -2066,8 +2103,8 @@ app.post('/notify-teacher', async (req, res) => {
     // ผู้เรียกต้องเป็นเจ้าของคำร้อง ครูของวิชานั้น หรือแอดมิน
     if (auth.via === 'token') {
       const c = auth.claims;
-      const allowed = (c.role === 'student' && c.sid === reqData.studentId)
-        || (c.role === 'teacher' && c.tid === reqData.teacherId)
+      const allowed = (c.role === 'student' && String(c.sid) === String(reqData.studentId))
+        || (c.role === 'teacher' && String(c.tid) === String(reqData.teacherId))
         || c.role === 'admin' || c.role === 'staff';
       if (!allowed) return res.status(403).json({ error: 'Forbidden' });
     }
@@ -2113,13 +2150,13 @@ app.post('/notify-student', async (req, res) => {
     if (!reqSnap || !reqSnap.exists) return res.status(404).json({ error: 'Request not found' });
     const reqData = reqSnap.data();
 
-    if (reqData.studentId !== studentId) {
+    if (String(reqData.studentId) !== String(studentId)) {
       return res.status(400).json({ error: 'studentId ไม่ตรงกับคำร้อง' });
     }
     // ผู้เรียกต้องเป็นครูของวิชานั้น หรือแอดมิน
     if (auth.via === 'token') {
       const c = auth.claims;
-      const allowed = (c.role === 'teacher' && c.tid === reqData.teacherId)
+      const allowed = (c.role === 'teacher' && String(c.tid) === String(reqData.teacherId))
         || c.role === 'admin' || c.role === 'staff';
       if (!allowed) return res.status(403).json({ error: 'Forbidden' });
     }
@@ -2145,6 +2182,47 @@ app.post('/notify-student', async (req, res) => {
     res.json({ sent: true, studentId, lineUserId });
   } catch (err) {
     console.error('Notify student error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /notify-staff (เรียกจาก Web App เมื่อครูอนุมัติผลการเรียน)
+// Body: { action, requestId, requestIds, prevGrade, newGrade, teacherName, force }
+// ════════════════════════════════════════════════════════════════
+app.post('/notify-staff', async (req, res) => {
+  const auth = await authorizeNotify(req);
+  if (!auth) return res.status(401).json({ error: 'Unauthorized' });
+
+  // ผู้เรียกต้องเป็นครู เจ้าหน้าที่ หรือแอดมิน
+  if (auth.via === 'token') {
+    const c = auth.claims;
+    const allowed = c.role === 'teacher' || c.role === 'staff' || c.role === 'admin';
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    if (!db) return res.status(500).json({ error: 'Firebase not connected' });
+    const { action, requestId, prevGrade, newGrade, teacherName, force } = req.body || {};
+
+    if (action === 'grade_changed') {
+      // แจ้งฝ่ายวัดผลทันที (กรณีแก้เกรดที่เคยอนุมัติไปแล้ว)
+      let reqData = null;
+      if (requestId) {
+        const snap = await db.collection('requests').doc(requestId).get();
+        if (snap.exists) reqData = snap.data();
+      }
+      if (reqData) {
+        await notifyStaffGradeChanged(reqData, prevGrade, newGrade, teacherName || 'คุณครู');
+        return res.json({ sent: true, action: 'grade_changed' });
+      }
+    }
+
+    // ปกติ: ส่งสรุปรวบยอด digest (หรือบังคับส่งทันทีเมื่อเรียกจากหน้าเว็บ)
+    const result = await notifyStaffDigest({ force: force !== false });
+    res.json({ sent: true, action: 'digest', result });
+  } catch (err) {
+    console.error('Notify staff error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -4022,6 +4100,236 @@ app.post('/api/auth/verify-line-otp', async (req, res) => {
     }
   } catch (err) {
     console.error('auth/verify-line-otp error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// HELPER: ตรวจสอบและดำเนินการเข้าสู่ระบบด้วย LINE
+// ════════════════════════════════════════════════════════════════
+async function handleLineLoginCheck(lineUserId, displayName, pictureUrl, res) {
+  const uid = String(lineUserId || '').trim();
+  if (!uid) return res.status(400).json({ error: 'ไม่พบ LINE User ID' });
+
+  // 1. ตรวจสอบว่าตรงกับครูหรือไม่
+  const tSnap = await db.collection('teachers').where('lineUserId', '==', uid).limit(1).get();
+  if (!tSnap.empty) {
+    const tDoc = tSnap.docs[0];
+    const teacher = { id: tDoc.id, ...tDoc.data() };
+    const token = await mintToken('tch_' + teacher.id, { role: 'teacher', tid: teacher.id });
+    logServer('activity', 'ครูเข้าสู่ระบบผ่าน LINE 1-Click', (teacher.name || '-') + ' (' + uid + ')');
+    return res.json({
+      ok: true,
+      role: 'teacher',
+      token,
+      teacher: { id: teacher.id, name: teacher.name, department: teacher.department || '' }
+    });
+  }
+
+  // 2. ตรวจสอบว่าตรงกับนักเรียนหรือไม่
+  const sSnap = await db.collection('students').where('lineUserId', '==', uid).limit(1).get();
+  if (!sSnap.empty) {
+    const sDoc = sSnap.docs[0];
+    const student = { id: sDoc.id, ...sDoc.data() };
+    const token = await mintToken('stu_' + student.id, { role: 'student', sid: student.id });
+    logServer('activity', 'นักเรียนเข้าสู่ระบบผ่าน LINE 1-Click', (student.name || '-') + ' (' + uid + ')');
+    return res.json({
+      ok: true,
+      role: 'student',
+      token,
+      student: { id: student.id, name: student.name, studentClass: student.studentClass || '', studentNo: student.studentNo || '' }
+    });
+  }
+
+  // 3. ตรวจสอบว่าตรงกับเจ้าหน้าที่/แอดมินหรือไม่
+  const aSnap = await db.collection('admin_users').where('lineUserId', '==', uid).where('isActive', '==', true).limit(1).get();
+  if (!aSnap.empty) {
+    const aDoc = aSnap.docs[0];
+    const staff = { id: aDoc.id, ...aDoc.data() };
+    const token = await mintToken('adm_' + staff.id, { role: 'staff', aid: staff.id });
+    logServer('activity', 'เจ้าหน้าที่เข้าสู่ระบบผ่าน LINE 1-Click', (staff.name || '-') + ' (' + uid + ')');
+    return res.json({
+      ok: true,
+      role: 'sub',
+      token,
+      staff: { id: staff.id, name: staff.name, username: staff.username }
+    });
+  }
+
+  // 4. ยังไม่ได้ผูกบัญชี -> ตอบ needLink: true พร้อม profile
+  return res.json({
+    ok: true,
+    needLink: true,
+    lineProfile: {
+      lineUserId: uid,
+      displayName: displayName || '',
+      pictureUrl: pictureUrl || ''
+    }
+  });
+}
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/line-magic (เข้าสู่ระบบจากลิงก์แตะครั้งเดียวใน LINE OA)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/line-magic', async (req, res) => {
+  try {
+    const { luid, lt, lsig, ldn, lpic } = req.body || {};
+    if (!luid || !lt || !lsig) return res.status(400).json({ error: 'ลิงก์ไม่สมบูรณ์' });
+
+    const elapsed = Date.now() - parseInt(lt, 10);
+    if (isNaN(elapsed) || elapsed < 0 || elapsed > 30 * 24 * 60 * 60 * 1000) { // 30 วัน
+      return res.status(401).json({ error: 'ลิงก์หมดอายุแล้ว' });
+    }
+    const expected = sha256hex(`${WEBHOOK_SECRET}:${luid}:${lt}`);
+    if (!safeEqual(expected, lsig)) return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
+
+    return await handleLineLoginCheck(luid, decodeURIComponent(ldn || ''), decodeURIComponent(lpic || ''), res);
+  } catch (err) {
+    console.error('auth/line-magic error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/line (เข้าสู่ระบบด้วย LINE Profile บนเว็บ)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/line', async (req, res) => {
+  try {
+    const { lineUserId, displayName, pictureUrl } = req.body || {};
+    return await handleLineLoginCheck(lineUserId, displayName, pictureUrl, res);
+  } catch (err) {
+    console.error('auth/line error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/line-register (ลงทะเบียนใหม่หรือผูกบัญชีเดิมกับ LINE)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/line-register', async (req, res) => {
+  try {
+    const { role, identifier, pin, name, studentClass, studentNo, email, lineProfile, isNewStudent } = req.body || {};
+    const lineUserId = String(lineProfile?.lineUserId || '').trim();
+    if (!lineUserId) return res.status(400).json({ error: 'ไม่พบ LINE User ID สำหรับผูกบัญชี' });
+    const inputPin = String(pin || '').trim();
+
+    if (role === 'teacher') {
+      const id = String(identifier || '').trim();
+      if (!id || !inputPin) return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
+
+      // ค้นหาครูด้วย ID หรือเบอร์โทร
+      let teacherDoc = await db.collection('teachers').doc(id).get();
+      if (!teacherDoc.exists) {
+        const phone = id.replace(/\D/g, '');
+        const snap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
+        if (!snap.empty) teacherDoc = snap.docs[0];
+      }
+      if (!teacherDoc.exists) return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครูในระบบ' });
+
+      const teacherId = teacherDoc.id;
+      const expectedPin = await effectiveTeacherPin(teacherId);
+      if (inputPin !== expectedPin) {
+        return res.status(400).json({ error: 'รหัส PIN ของครูไม่ถูกต้อง (PIN เริ่มต้นคือ 2026)' });
+      }
+
+      await db.collection('teachers').doc(teacherId).update({
+        lineUserId,
+        lineDisplayName: lineProfile.displayName || '',
+        linePictureUrl: lineProfile.pictureUrl || '',
+        lineLinkedAt: new Date().toISOString()
+      });
+
+      const teacher = teacherDoc.data();
+      const token = await mintToken('tch_' + teacherId, { role: 'teacher', tid: teacherId });
+      logServer('activity', 'คุณครูผูกบัญชีกับ LINE สำเร็จ', (teacher.name || teacherId) + ' (' + lineUserId + ')');
+
+      return res.json({
+        ok: true,
+        role: 'teacher',
+        token,
+        teacher: { id: teacherId, name: teacher.name, department: teacher.department || '' }
+      });
+
+    } else if (role === 'student') {
+      const id = String(identifier || '').trim();
+      if (!/^\d{5}$/.test(id)) return res.status(400).json({ error: 'รหัสนักเรียนต้องเป็นตัวเลข 5 หลัก' });
+      if (!isPin(inputPin)) return res.status(400).json({ error: 'PIN ต้องเป็นตัวเลข 4 หลัก' });
+
+      if (isNewStudent) {
+        const cleanName = String(name || '').trim();
+        const cleanEmail = String(email || '').trim().toLowerCase();
+        if (!cleanName) return res.status(400).json({ error: 'กรุณากรอกชื่อ-นามสกุล' });
+        if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+          return res.status(400).json({ error: 'กรุณากรอกอีเมลที่ถูกต้อง' });
+        }
+
+        const existingPin = await studentSecret(id, 'pin');
+        if (existingPin) {
+          return res.status(409).json({ error: 'รหัสนักเรียนนี้มีอยู่ในระบบแล้ว กรุณาเลือก "มีบัญชีอยู่แล้ว" เพื่อผูก LINE' });
+        }
+
+        const studentData = {
+          id,
+          name: cleanName,
+          studentClass: String(studentClass || '').trim(),
+          studentNo: String(studentNo || '').trim(),
+          email: cleanEmail,
+          lineUserId,
+          lineDisplayName: lineProfile.displayName || '',
+          linePictureUrl: lineProfile.pictureUrl || '',
+          lineLinkedAt: new Date().toISOString(),
+          createdAt: new Date().toISOString()
+        };
+
+        await db.collection('students').doc(id).set(studentData, { merge: true });
+        await writeSecret('student_secrets', id, { pin: inputPin, email: cleanEmail });
+
+        const token = await mintToken('stu_' + id, { role: 'student', sid: id });
+        logServer('activity', 'นักเรียนลงทะเบียนใหม่พร้อมผูก LINE สำเร็จ', cleanName + ' (' + id + ')');
+
+        return res.json({
+          ok: true,
+          role: 'student',
+          token,
+          student: studentData
+        });
+
+      } else {
+        // ผูกบัญชีนักเรียนเดิม
+        const studentDoc = await db.collection('students').doc(id).get();
+        if (!studentDoc.exists) return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนในระบบ กรุณาเลือก "ลงทะเบียนใหม่"' });
+
+        const storedPin = await studentSecret(id, 'pin');
+        if (!storedPin) {
+          // ยังไม่เคยตั้ง PIN -> อนุญาตให้ตั้ง PIN ครั้งแรกได้เลย
+          await writeSecret('student_secrets', id, { pin: inputPin });
+        } else if (storedPin !== inputPin) {
+          return res.status(400).json({ error: 'รหัส PIN 4 หลักไม่ถูกต้อง' });
+        }
+
+        await db.collection('students').doc(id).update({
+          lineUserId,
+          lineDisplayName: lineProfile.displayName || '',
+          linePictureUrl: lineProfile.pictureUrl || '',
+          lineLinkedAt: new Date().toISOString()
+        });
+
+        const student = studentDoc.data();
+        const token = await mintToken('stu_' + id, { role: 'student', sid: id });
+        logServer('activity', 'นักเรียนผูกบัญชีเดิมกับ LINE สำเร็จ', (student.name || id) + ' (' + lineUserId + ')');
+
+        return res.json({
+          ok: true,
+          role: 'student',
+          token,
+          student: { id, name: student.name, studentClass: student.studentClass || '', studentNo: student.studentNo || '' }
+        });
+      }
+    } else {
+      return res.status(400).json({ error: 'บทบาทไม่ถูกต้อง' });
+    }
+  } catch (err) {
+    console.error('auth/line-register error:', err);
     res.status(500).json({ error: err.message });
   }
 });
