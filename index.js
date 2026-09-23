@@ -3187,6 +3187,28 @@ app.post('/api/auth/student-register', async (req, res) => {
   }
 });
 
+// ── ครู: รายชื่อสาธารณะสำหรับ Dropdown / ค้นหา (ปลอดภัย ไม่มี PIN) ──
+app.get('/api/public-teachers', async (req, res) => {
+  try {
+    const snap = await db.collection('teachers').get();
+    const list = snap.docs.map(d => {
+      const data = d.data();
+      return {
+        id: d.id,
+        name: (data.name || '').trim(),
+        department: (data.department || '').trim(),
+        isExternalOrFormer: !!data.isExternalOrFormer
+      };
+    }).filter(t => t.name.length > 0)
+      .sort((a, b) => a.name.localeCompare(b.name, 'th'));
+
+    res.json({ ok: true, teachers: list });
+  } catch (err) {
+    console.error('auth/public-teachers error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── ครู: ค้นหาจากเบอร์โทร (ไม่คืน PIN) ────────────────────────────
 app.post('/api/auth/teacher-lookup', async (req, res) => {
   try {
