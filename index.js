@@ -2842,6 +2842,247 @@ async function consumeEmailProof(proof) {
 const MAX_OTP_TRIES = 5;
 function otpLocked(token) { return tooManyFails('otp:' + token) || (failCounts.get('otp:' + token)?.count || 0) >= MAX_OTP_TRIES; }
 
+// ════════════════════════════════════════════════════════════════
+// ── ระบบยืนยันตัวตนและเปิดใช้งานบัญชีครั้งแรก (First-Time Activation) ──
+// ════════════════════════════════════════════════════════════════
+
+function normalizeThaiTitle(raw) {
+  if (!raw) return '';
+  let s = String(raw).trim();
+  s = s.replace(/^(ด\.ช\.|เด็กชาย)/, 'เด็กชาย');
+  s = s.replace(/^(ด\.ญ\.|เด็กหญิง)/, 'เด็กหญิง');
+  s = s.replace(/^(น\.ส\.|นางสาว)/, 'นางสาว');
+  s = s.replace(/^(นาย)/, 'นาย');
+  return s;
+}
+
+function matchStudentFullName(dbFullName, inputPrefix, inputFirstName, inputLastName) {
+  if (!dbFullName) return false;
+  const cleanDb = String(dbFullName).replace(/\s+/g, ' ').trim();
+  const cleanFirst = String(inputFirstName || '').replace(/\s+/g, '').trim();
+  const cleanLast = String(inputLastName || '').replace(/\s+/g, '').trim();
+  const normInputPrefix = normalizeThaiTitle(inputPrefix);
+  
+  let dbWithoutPrefix = cleanDb;
+  let dbPrefix = '';
+  const prefixes = ['เด็กชาย', 'ด.ช.', 'เด็กหญิง', 'ด.ญ.', 'นางสาว', 'น.ส.', 'นาย'];
+  for (const p of prefixes) {
+    if (cleanDb.startsWith(p)) {
+      dbPrefix = normalizeThaiTitle(p);
+      dbWithoutPrefix = cleanDb.slice(p.length).trim();
+      break;
+    }
+  }
+
+  const parts = dbWithoutPrefix.split(/\s+/);
+  const dbFirst = parts[0] ? parts[0].trim() : '';
+  const dbLast = parts.slice(1).join('') ? parts.slice(1).join('').trim() : '';
+
+  const prefixMatches = !normInputPrefix || !dbPrefix || normInputPrefix === dbPrefix;
+  const firstMatches = dbFirst && cleanFirst && (dbFirst === cleanFirst);
+  const lastMatches = dbLast && cleanLast && (dbLast === cleanLast);
+
+  if (prefixMatches && firstMatches && lastMatches) return true;
+
+  const combinedInput = (normInputPrefix + cleanFirst + cleanLast).replace(/\s+/g, '');
+  const combinedDb = (dbPrefix + dbFirst + dbLast).replace(/\s+/g, '');
+  if (combinedInput === combinedDb) return true;
+
+  return false;
+}
+
+// 1. ตรวจสอบข้อมูลก่อนเปิดใช้งาน (Pre-check verification)
+app.post('/api/auth/verify-student-info', async (req, res) => {
+  try {
+    const { studentId, prefix, firstName, lastName } = req.body || {};
+    const id = String(studentId || '').trim();
+    if (!/^\d{5}$/.test(id)) {
+      return res.status(400).json({ error: 'รหัสนักเรียนต้องเป็นตัวเลข 5 หลัก' });
+    }
+    if (!prefix || !firstName || !lastName) {
+      return res.status(400).json({ error: 'กรุณากรอกคำนำหน้า ชื่อ และนามสกุล ให้ครบถ้วน' });
+    }
+
+    const doc = await db.collection('students').doc(id).get();
+    if (!doc.exists) {
+      return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในฐานข้อมูลโรงเรียน' });
+    }
+
+    const data = doc.data();
+    if (data.isActivated && (data.email || data.lineUserId)) {
+      const boundInfo = data.email ? data.email.replace(/(.{2})(.*)(@.*)/, '$1***$3') : (data.lineDisplayName ? `LINE (${data.lineDisplayName})` : 'บัญชีอื่น');
+      return res.status(409).json({
+        error: `รหัสนักเรียนนี้เปิดใช้งานและผูกกับ ${boundInfo} แล้ว หากไม่ใช่บัญชีของคุณ กรุณาติดต่อคุณครูเพื่อขอปลดล็อก`,
+        isAlreadyActivated: true
+      });
+    }
+
+    const matched = matchStudentFullName(data.name, prefix, firstName, lastName);
+    if (!matched) {
+      return res.status(400).json({
+        error: 'ข้อมูลคำนำหน้า ชื่อ หรือนามสกุล ไม่ตรงกับฐานข้อมูลนักเรียน กรุณาตรวจสอบการสะกด'
+      });
+    }
+
+    // นับจำนวนวิชาที่ติด 0, ร, มส
+    const defSnap = await db.collection('defective_records').where('studentId', '==', id).get();
+    const defectCount = defSnap.size;
+
+    return res.json({
+      ok: true,
+      student: {
+        id,
+        name: data.name,
+        studentClass: data.studentClass || '',
+        studentNo: data.studentNo || '',
+        defectCount
+      }
+    });
+  } catch (err) {
+    console.error('auth/verify-student-info error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. ยืนยันเปิดใช้งานบัญชีจริง พร้อมผูก Google หรือ LINE และตั้ง PIN ส่วนตัว
+app.post('/api/auth/activate-student', async (req, res) => {
+  try {
+    const { studentId, prefix, firstName, lastName, pin, idToken, linkProof, lineProfile } = req.body || {};
+    const id = String(studentId || '').trim();
+    if (!/^\d{5}$/.test(id) || !isPin(pin)) {
+      return res.status(400).json({ error: 'กรุณากรอกรหัสนักเรียน 5 หลัก และตั้งรหัส PIN 4 หลัก' });
+    }
+    if (!prefix || !firstName || !lastName) {
+      return res.status(400).json({ error: 'กรุณากรอกคำนำหน้า ชื่อ และนามสกุล ให้ครบถ้วน' });
+    }
+
+    const doc = await db.collection('students').doc(id).get();
+    if (!doc.exists) {
+      return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในฐานข้อมูลโรงเรียน' });
+    }
+
+    const data = doc.data();
+    if (data.isActivated && (data.email || data.lineUserId)) {
+      return res.status(409).json({
+        error: 'รหัสนักเรียนนี้เปิดใช้งานและผูกบัญชีไปแล้ว กรุณาเข้าสู่ระบบ หรือติดต่อคุณครูเพื่อขอปลดล็อก'
+      });
+    }
+
+    const matched = matchStudentFullName(data.name, prefix, firstName, lastName);
+    if (!matched) {
+      return res.status(400).json({
+        error: 'ข้อมูลคำนำหน้า ชื่อ หรือนามสกุล ไม่ตรงกับฐานข้อมูลนักเรียน กรุณาตรวจสอบการสะกด'
+      });
+    }
+
+    let cleanEmail = '';
+    if (idToken) {
+      const g = await verifiedGoogleEmail(idToken);
+      if (g) cleanEmail = g.email;
+    } else if (linkProof) {
+      cleanEmail = (await consumeEmailProof(linkProof)) || '';
+    }
+
+    const lineUserId = String(lineProfile?.lineUserId || '').trim();
+
+    const updateData = {
+      isActivated: true,
+      activatedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    if (cleanEmail) {
+      updateData.email = cleanEmail;
+    }
+    if (lineUserId) {
+      updateData.lineUserId = lineUserId;
+      updateData.lineDisplayName = lineProfile.displayName || '';
+      updateData.linePictureUrl = lineProfile.pictureUrl || '';
+      updateData.lineLinkedAt = new Date().toISOString();
+    }
+
+    await db.collection('students').doc(id).set(updateData, { merge: true });
+    await writeSecret('student_secrets', id, {
+      pin: String(pin).trim(),
+      email: cleanEmail || data.email || ''
+    });
+
+    const token = await mintToken('stu_' + id, { role: 'student', sid: id });
+    logServer('activity', 'นักเรียนเปิดใช้งานบัญชีสำเร็จ', (data.name || id) + ' (' + id + ')' + (cleanEmail ? ` <${cleanEmail}>` : '') + (lineUserId ? ` [LINE: ${lineProfile?.displayName || lineUserId}]` : ''));
+
+    return res.json({
+      ok: true,
+      role: 'student',
+      token,
+      student: {
+        id,
+        name: data.name,
+        studentClass: data.studentClass || '',
+        studentNo: data.studentNo || '',
+        email: cleanEmail || data.email || '',
+        isActivated: true
+      }
+    });
+  } catch (err) {
+    console.error('auth/activate-student error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. คุณครู / ฝ่ายวัดผล: ปลดการผูกบัญชีนักเรียน (Reset Student Activation)
+app.post('/api/teacher/reset-student-auth', async (req, res) => {
+  try {
+    const c = await callerClaims(req);
+    if (!c || (c.role !== 'teacher' && c.role !== 'staff' && c.role !== 'admin')) {
+      return res.status(403).json({ error: 'เฉพาะคุณครูหรือฝ่ายวัดผลเท่านั้นที่มีสิทธิ์รีเซ็ตบัญชีนักเรียน' });
+    }
+
+    const { studentId, reason } = req.body || {};
+    const id = String(studentId || '').trim();
+    if (!/^\d{5}$/.test(id)) {
+      return res.status(400).json({ error: 'รหัสนักเรียนไม่ถูกต้อง' });
+    }
+
+    const sDoc = await db.collection('students').doc(id).get();
+    if (!sDoc.exists) {
+      return res.status(404).json({ error: 'ไม่พบรหัสนักเรียน' });
+    }
+
+    const sData = sDoc.data();
+    const oldEmail = sData.email || '-';
+    const oldLine = sData.lineDisplayName || sData.lineUserId || '-';
+
+    // ล้างข้อมูลการผูกบัญชี
+    await db.collection('students').doc(id).update({
+      isActivated: false,
+      activatedAt: null,
+      email: admin.firestore.FieldValue.delete(),
+      lineUserId: admin.firestore.FieldValue.delete(),
+      lineDisplayName: admin.firestore.FieldValue.delete(),
+      linePictureUrl: admin.firestore.FieldValue.delete(),
+      lineLinkedAt: admin.firestore.FieldValue.delete(),
+      updatedAt: new Date().toISOString()
+    });
+
+    // รีเซ็ต PIN ใน student_secrets
+    await writeSecret('student_secrets', id, {
+      pin: DEFAULT_TEACHER_PIN,
+      email: ''
+    });
+
+    const teacherName = c.name || (c.role === 'teacher' ? 'คุณครู' : 'ฝ่ายวัดผล');
+    logServer('security_action', 'ปลดการผูกบัญชีนักเรียน', `${teacherName} รีเซ็ตบัญชีนักเรียน ${sData.name || id} (${id}) เดิมผูกกับ Google: ${oldEmail}, LINE: ${oldLine} เหตุผล: ${reason || 'ขอรีเซ็ต'}`);
+
+    return res.json({
+      ok: true,
+      message: `ปลดการผูกบัญชีของนักเรียน ${sData.name || id} เรียบร้อยแล้ว นักเรียนสามารถเปิดใช้งานใหม่ได้ทันที`
+    });
+  } catch (err) {
+    console.error('teacher/reset-student-auth error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── นักเรียน: เข้าสู่ระบบ ─────────────────────────────────────────
 app.post('/api/auth/student', async (req, res) => {
   try {
@@ -2856,16 +3097,29 @@ app.post('/api/auth/student', async (req, res) => {
     const doc = await db.collection('students').doc(id).get();
     if (!doc.exists) return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในระบบ', notFound: true });
 
+    const data = doc.data();
     const stored = await studentSecret(id, 'pin');
-    if (!stored) return res.status(409).json({ error: 'ยังไม่ได้ตั้ง PIN', needsPin: true });
+    if (!stored) {
+      return res.status(409).json({
+        error: 'รหัสนักเรียนนี้ยังไม่ได้ตั้ง PIN กรุณากด "เปิดใช้งานบัญชีครั้งแรก"',
+        needsActivation: true
+      });
+    }
+
+    // หากบัญชียังไม่ได้เปิดใช้งาน (isActivated !== true) และส่ง PIN 2026 กลางมา
+    if (!data.isActivated && stored === DEFAULT_TEACHER_PIN) {
+      return res.status(409).json({
+        error: 'รหัสนักเรียนนี้ยังไม่ได้เปิดใช้งาน กรุณากด "เปิดใช้งานบัญชีครั้งแรก" เพื่อยืนยันตัวตนและผูกบัญชี Google หรือ LINE ของตนเอง',
+        needsActivation: true
+      });
+    }
+
     if (stored !== pin) {
       noteFail(key);
       logServer('login_fail', 'นักเรียนกรอก PIN ผิด', 'รหัสนักเรียน ' + id + ' (' + (doc.data().name || '-') + ')', { studentId: id });
       return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
     }
     clearFails(key);
-
-    const data = doc.data();
     let email = data.email;
     if (!email) {
       email = await studentSecret(id, 'email');
@@ -3721,17 +3975,38 @@ const handleLinkAccount = async (req, res) => {
       }
 
       // กรณีผูกบัญชีนักเรียนเดิมที่มีข้อมูลอยู่แล้ว
+      const sData = sDoc.data();
+      if (sData.isActivated && sData.email && sData.email !== cleanEmail) {
+        return res.status(409).json({ error: 'รหัสนักเรียนนี้เปิดใช้งานและผูกกับอีเมลอื่นแล้ว หากไม่ใช่บัญชีของคุณ กรุณาติดต่อคุณครูเพื่อขอปลดล็อก' });
+      }
+
+      // หากยังไม่ได้เปิดใช้งานบัญชี
+      if (!sData.isActivated) {
+        const { prefix: reqPrefix, firstName: reqFirst, lastName: reqLast } = req.body || {};
+        if (reqPrefix && reqFirst && reqLast) {
+          const m = matchStudentFullName(sData.name, reqPrefix, reqFirst, reqLast);
+          if (!m) return res.status(400).json({ error: 'ข้อมูลคำนำหน้า ชื่อ หรือนามสกุล ไม่ตรงกับฐานข้อมูลนักเรียน กรุณาตรวจสอบการสะกด' });
+        } else if (pin === DEFAULT_TEACHER_PIN) {
+          return res.status(409).json({ error: 'รหัสนักเรียนนี้ยังไม่ได้เปิดใช้งาน กรุณาใช้ระบบ "เปิดใช้งานบัญชีครั้งแรก" เพื่อยืนยันตัวตน' });
+        }
+      }
+
       const key = 'stu:' + sid;
       if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
 
       const stored = await studentSecret(sid, 'pin');
-      if (stored && stored !== pin) {
+      if (stored && stored !== pin && (!isPin(pin) || stored !== DEFAULT_TEACHER_PIN)) {
         noteFail(key);
         return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
       }
       clearFails(key);
 
-      await db.collection('students').doc(sid).set({ email: cleanEmail }, { merge: true });
+      await db.collection('students').doc(sid).set({
+        email: cleanEmail,
+        isActivated: true,
+        activatedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
       await writeSecret('student_secrets', sid, { email: cleanEmail, pin });
 
       const token = await mintToken('stu_' + sid, { role: 'student', sid });
@@ -4333,24 +4608,39 @@ app.post('/api/auth/line-register', async (req, res) => {
       } else {
         // ผูกบัญชีนักเรียนเดิม
         const studentDoc = await db.collection('students').doc(id).get();
-        if (!studentDoc.exists) return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนในระบบ กรุณาเลือก "ลงทะเบียนใหม่"' });
+        if (!studentDoc.exists) return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนในระบบ กรุณาเลือก "เปิดใช้งานบัญชีครั้งแรก"' });
+
+        const student = studentDoc.data();
+        if (student.isActivated && student.lineUserId && student.lineUserId !== lineUserId) {
+          return res.status(409).json({ error: 'รหัสนักเรียนนี้เปิดใช้งานและผูกกับ LINE อื่นแล้ว หากไม่ใช่บัญชีของคุณ กรุณาติดต่อคุณครูเพื่อขอปลดล็อก' });
+        }
 
         const storedPin = await studentSecret(id, 'pin');
-        if (!storedPin) {
-          // ยังไม่เคยตั้ง PIN -> อนุญาตให้ตั้ง PIN ครั้งแรกได้เลย
-          await writeSecret('student_secrets', id, { pin: inputPin });
-        } else if (storedPin !== inputPin) {
+        if (!student.isActivated) {
+          const { prefix: reqPrefix, firstName: reqFirst, lastName: reqLast } = req.body || {};
+          if (reqPrefix && reqFirst && reqLast) {
+            const m = matchStudentFullName(student.name, reqPrefix, reqFirst, reqLast);
+            if (!m) return res.status(400).json({ error: 'ข้อมูลคำนำหน้า ชื่อ หรือนามสกุล ไม่ตรงกับฐานข้อมูลนักเรียน กรุณาตรวจสอบการสะกด' });
+          } else if (storedPin === DEFAULT_TEACHER_PIN) {
+            return res.status(409).json({ error: 'รหัสนักเรียนนี้ยังไม่ได้เปิดใช้งาน กรุณาใช้เมนู "เปิดใช้งานบัญชีครั้งแรก" เพื่อยืนยันตัวตน' });
+          }
+        }
+
+        if (storedPin && storedPin !== inputPin && storedPin !== DEFAULT_TEACHER_PIN) {
           return res.status(400).json({ error: 'รหัส PIN 4 หลักไม่ถูกต้อง' });
         }
 
+        await writeSecret('student_secrets', id, { pin: inputPin });
+
         await db.collection('students').doc(id).update({
+          isActivated: true,
+          activatedAt: new Date().toISOString(),
           lineUserId,
           lineDisplayName: lineProfile.displayName || '',
           linePictureUrl: lineProfile.pictureUrl || '',
           lineLinkedAt: new Date().toISOString()
         });
 
-        const student = studentDoc.data();
         const token = await mintToken('stu_' + id, { role: 'student', sid: id });
         logServer('activity', 'นักเรียนผูกบัญชีเดิมกับ LINE สำเร็จ', (student.name || id) + ' (' + lineUserId + ')');
 
