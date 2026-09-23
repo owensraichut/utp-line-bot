@@ -261,11 +261,44 @@ function buildTeacherFlex(req, magicUrl) {
   };
 }
 
+// ── Flex Card: แจ้งเตือนเมื่อผูกบัญชี LINE สำเร็จ ─────────────────────
+function buildLineLinkedFlex({ role, name, extraInfo }) {
+  const isTeacher = role === 'teacher';
+  const roleName = isTeacher ? 'คุณครู' : (role === 'staff' ? 'เจ้าหน้าที่วัดผล' : 'นักเรียน');
+  const themeColor = isTeacher ? '#4F46E5' : '#059669';
+  return {
+    type: 'bubble', size: 'kilo',
+    header: {
+      type: 'box', layout: 'vertical', backgroundColor: themeColor, paddingAll: '12px',
+      contents: [{ type: 'text', text: '🎉 ผูกบัญชี LINE สำเร็จ', color: '#FFFFFF', weight: 'bold', size: 'md' }]
+    },
+    body: {
+      type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px',
+      contents: [
+        { type: 'text', text: `ยินดีต้อนรับ ${roleName}`, size: 'xs', color: '#6B7280' },
+        { type: 'text', text: name || '-', size: 'md', weight: 'bold', wrap: true },
+        ...(extraInfo ? [{ type: 'text', text: extraInfo, size: 'xs', color: '#4B5563', wrap: true }] : []),
+        { type: 'separator', margin: 'md' },
+        { type: 'text', text: '✅ บัญชีของคุณเชื่อมต่อกับระบบ SGS อุเทนพัฒนาเรียบร้อยแล้ว ทุกครั้งที่มีคำร้องใหม่ หรือมีความคืบหน้าของผลการเรียน ระบบจะแจ้งเตือนผ่าน LINE ให้ทราบทันที', size: 'xs', color: '#16A34A', wrap: true }
+      ]
+    },
+    footer: {
+      type: 'box', layout: 'vertical', paddingAll: '10px',
+      contents: [
+        { type: 'button', style: 'primary', color: themeColor, height: 'sm',
+          action: { type: 'uri', label: '🌐 เข้าสู่ระบบ SGS', uri: BASE_URL } }
+      ]
+    }
+  };
+}
+
 // ── Flex Card: แจ้งนักเรียน ─────────────────────────────────────
 function buildStudentFlex(req) {
   const statusMap = {
+    submitted: { color: '#2563EB', label: 'ยื่นคำร้องแล้ว รอครูผู้สอนตรวจ' },
+    pending_teacher: { color: '#2563EB', label: 'ยื่นคำร้องแล้ว รอครูผู้สอนตรวจ' },
     teacher_approved: { color: '#1976D2', label: 'ครูอนุมัติเกรดแล้ว รอฝ่ายวัดผล' },
-    completed: { color: '#0B6623', label: 'ดำเนินการเสร็จสิ้น!' },
+    completed: { color: '#0B6623', label: 'ฝ่ายวัดผลบันทึกลง SGS เสร็จสิ้น!' },
     rejected: { color: '#CC0000', label: 'คำร้องถูกปฏิเสธ' },
     assigned_work: { color: '#7B1FA2', label: 'ครูสั่งงานแล้ว รอนักเรียนส่ง' },
   };
@@ -2186,10 +2219,11 @@ app.post('/notify-student', async (req, res) => {
     if (String(reqData.studentId) !== String(studentId)) {
       return res.status(400).json({ error: 'studentId ไม่ตรงกับคำร้อง' });
     }
-    // ผู้เรียกต้องเป็นครูของวิชานั้น หรือแอดมิน
+    // ผู้เรียกต้องเป็นครูของวิชานั้น หรือแอดมิน หรือตัวนักเรียนเจ้าของคำร้อง
     if (auth.via === 'token') {
       const c = auth.claims;
       const allowed = (c.role === 'teacher' && String(c.tid) === String(reqData.teacherId))
+        || (c.role === 'student' && String(c.sid) === String(reqData.studentId))
         || c.role === 'admin' || c.role === 'staff';
       if (!allowed) return res.status(403).json({ error: 'Forbidden' });
     }
@@ -2207,6 +2241,8 @@ app.post('/notify-student', async (req, res) => {
 
     const flex = buildStudentFlex(reqData);
     const statusLabels = {
+      submitted: 'ยื่นคำร้องสำเร็จ',
+      pending_teacher: 'ยื่นคำร้องสำเร็จ',
       teacher_approved: 'ครูอนุมัติเกรดแล้ว',
       completed: 'ดำเนินการเสร็จสิ้น',
       rejected: 'คำร้องถูกปฏิเสธ',
@@ -2223,7 +2259,7 @@ app.post('/notify-student', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// ROUTE: POST /notify-staff (เรียกจาก Web App เมื่อครูอนุมัติผลการเรียน)
+// ROUTE: POST /notify-staff (เรียกจาก Web App เมื่อครูอนุมัติผลการเรียน / แอดมินอนุมัติ)
 // Body: { action, requestId, requestIds, prevGrade, newGrade, teacherName, force }
 // ════════════════════════════════════════════════════════════════
 app.post('/notify-staff', async (req, res) => {
@@ -2254,12 +2290,187 @@ app.post('/notify-staff', async (req, res) => {
       }
     }
 
+    if (action === 'teacher_approved') {
+      // เมื่อครูอนุมัติเกรด ส่งแจ้งเตือนไปยังเจ้าหน้าที่วัดผล (staffLineIds) ทันที
+      let reqData = null;
+      if (requestId) {
+        const snap = await db.collection('requests').doc(requestId).get();
+        if (snap.exists) reqData = snap.data();
+      }
+      if (reqData) {
+        const targets = await staffLineIds();
+        const flex = {
+          type: 'bubble', size: 'kilo',
+          header: {
+            type: 'box', layout: 'vertical', backgroundColor: '#1E40AF', paddingAll: '12px',
+            contents: [{ type: 'text', text: '📥 ครูอนุมัติเกรดแล้ว (รอวัดผล)', color: '#FFFFFF', weight: 'bold', size: 'sm' }]
+          },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '14px',
+            contents: [
+              { type: 'text', text: reqData.studentName || '-', weight: 'bold', size: 'md' },
+              { type: 'text', text: `รหัส ${reqData.studentId} · ชั้น ${reqData.studentClass || '-'}`, size: 'xs', color: '#6B7280' },
+              { type: 'separator', margin: 'sm' },
+              { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.subjectName || '-'})`, size: 'xs', wrap: true },
+              { type: 'text', text: `เกรด: ${reqData.gradeType} → เกรดใหม่: ${reqData.newGrade || '-'}`, size: 'xs', color: '#16A34A', weight: 'bold' },
+              { type: 'text', text: `ครูผู้สอน: ${teacherName || reqData.teacherName || '-'}`, size: 'xs', color: '#4B5563' }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', paddingAll: '10px',
+            contents: [
+              { type: 'button', style: 'primary', color: '#1E40AF', height: 'sm',
+                action: { type: 'uri', label: '🌐 เปิดระบบ SGS เพื่อบันทึก', uri: `${BASE_URL}/?tab=pending` } }
+            ]
+          }
+        };
+        for (const staffId of targets) {
+          await sendLineFlexMessage(staffId, `ครูอนุมัติเกรด ${reqData.studentName} (${reqData.subjectCode}) รอดำเนินการ`, flex);
+        }
+        return res.json({ sent: true, action: 'teacher_approved', targets: targets.length });
+      }
+    }
+
+    if (action === 'completed') {
+      // ฝ่ายวัดผลบันทึกลง SGS สำเร็จ -> แจ้งเตือนครูผู้สอนทราบ
+      let reqData = null;
+      if (requestId) {
+        const snap = await db.collection('requests').doc(requestId).get();
+        if (snap.exists) reqData = snap.data();
+      }
+      if (reqData && reqData.teacherId) {
+        const tchDoc = await db.collection('teachers').doc(reqData.teacherId).get();
+        if (tchDoc.exists && tchDoc.data().lineUserId) {
+          const flex = {
+            type: 'bubble', size: 'kilo',
+            header: {
+              type: 'box', layout: 'vertical', backgroundColor: '#059669', paddingAll: '12px',
+              contents: [{ type: 'text', text: '✅ บันทึกเกรดลง SGS เรียบร้อยแล้ว', color: '#FFFFFF', weight: 'bold', size: 'sm' }]
+            },
+            body: {
+              type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '14px',
+              contents: [
+                { type: 'text', text: reqData.studentName || '-', weight: 'bold', size: 'md' },
+                { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.subjectName || '-'})`, size: 'xs', wrap: true },
+                { type: 'text', text: `ผลการเรียน: ${reqData.gradeType} → ${reqData.newGrade || '-'}`, size: 'xs', color: '#059669', weight: 'bold' },
+                { type: 'text', text: 'ฝ่ายวัดผลได้บันทึกคะแนน/ผลการเรียนลงในระบบ SGS เรียบร้อยแล้ว', size: 'xs', color: '#4B5563', wrap: true }
+              ]
+            }
+          };
+          await sendLineFlexMessage(tchDoc.data().lineUserId, `ฝ่ายวัดผลบันทึกผลการเรียน ${reqData.studentName} ลง SGS แล้ว`, flex);
+        }
+      }
+      return res.json({ sent: true, action: 'completed' });
+    }
+
     // ปกติ: ส่งสรุปรวบยอด digest (หรือบังคับส่งทันทีเมื่อเรียกจากหน้าเว็บ)
     const result = await notifyStaffDigest({ force: force !== false });
     res.json({ sent: true, action: 'digest', result });
   } catch (err) {
     console.error('Notify staff error:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/test-line-notify (ทดสอบการแจ้งเตือน LINE สำหรับผู้ใช้ที่ผูกบัญชี)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/test-line-notify', async (req, res) => {
+  try {
+    const auth = await authorizeNotify(req);
+    let targetId = req.body?.targetLineUserId;
+    let targetName = req.body?.name || '';
+    let targetRole = req.body?.role || '';
+
+    if (!targetId && auth?.claims) {
+      const c = auth.claims;
+      if (c.role === 'teacher' && c.tid) {
+        const snap = await db.collection('teachers').doc(c.tid).get();
+        if (snap.exists) {
+          targetId = snap.data().lineUserId;
+          targetName = snap.data().name || '';
+          targetRole = 'คุณครู';
+        }
+      } else if (c.role === 'student' && c.sid) {
+        const snap = await db.collection('students').doc(c.sid).get();
+        if (snap.exists) {
+          targetId = snap.data().lineUserId;
+          targetName = snap.data().name || '';
+          targetRole = 'นักเรียน';
+        }
+      } else if (c.role === 'admin' || c.role === 'staff') {
+        const staffs = await staffLineIds();
+        if (staffs.length > 0) {
+          targetId = staffs[0];
+          targetName = 'ผู้ดูแลระบบ / ฝ่ายวัดผล';
+          targetRole = 'ฝ่ายวัดผล';
+        }
+      }
+    }
+
+    if (!targetId && req.body?.teacherId) {
+      const snap = await db.collection('teachers').doc(req.body.teacherId).get();
+      if (snap.exists) {
+        targetId = snap.data().lineUserId;
+        targetName = snap.data().name;
+        targetRole = 'คุณครู';
+      }
+    }
+    if (!targetId && req.body?.studentId) {
+      const snap = await db.collection('students').doc(req.body.studentId).get();
+      if (snap.exists) {
+        targetId = snap.data().lineUserId;
+        targetName = snap.data().name;
+        targetRole = 'นักเรียน';
+      }
+    }
+    if (!targetId) {
+      const staffs = await staffLineIds();
+      if (staffs.length > 0) {
+        targetId = staffs[0];
+        targetName = 'ฝ่ายวัดผล';
+        targetRole = 'ฝ่ายวัดผล';
+      }
+    }
+
+    if (!targetId) {
+      return res.status(400).json({ ok: false, error: 'ไม่พบบัญชี LINE ที่ผูกไว้ในระบบ กรุณาผูกบัญชี LINE ก่อนทดสอบ' });
+    }
+
+    const flex = {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#059669', paddingAll: '12px',
+        contents: [
+          { type: 'text', text: '🔔 ทดสอบระบบแจ้งเตือน LINE', color: '#FFFFFF', weight: 'bold', size: 'md' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '14px',
+        contents: [
+          { type: 'text', text: 'ระบบ SGS โรงเรียนอุเทนพัฒนา', size: 'xs', color: '#6B7280' },
+          { type: 'text', text: 'การเชื่อมต่อระบบแจ้งเตือน LINE ทำงานปกติ 100%', size: 'sm', weight: 'bold', color: '#059669', wrap: true },
+          ...(targetName ? [{ type: 'text', text: `ผู้รับ: ${targetName} ${targetRole ? `(${targetRole})` : ''}`, size: 'xs', color: '#374151' }] : []),
+          { type: 'separator', margin: 'sm' },
+          { type: 'text', text: `เวลาทดสอบ: ${new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })}`, size: 'xs', color: '#4B5563' },
+          { type: 'text', text: 'ระบบพร้อมส่งการแจ้งเตือนเมื่อ:', size: 'xs', weight: 'bold', color: '#374151' },
+          { type: 'text', text: '• นักเรียนยื่นคำร้องแก้ 0, ร, มส, มผ\n• คุณครูอนุมัติเกรด / สั่งงาน\n• ฝ่ายวัดผลบันทึกลงระบบ SGS เรียบร้อย', size: 'xs', color: '#4B5563', wrap: true }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#059669', height: 'sm',
+            action: { type: 'uri', label: '🌐 เข้าสู่ระบบ SGS', uri: BASE_URL } }
+        ]
+      }
+    };
+
+    await sendLineFlexMessage(targetId, '🔔 ทดสอบการแจ้งเตือนระบบ SGS โรงเรียนอุเทนพัฒนา (ทำงานปกติ 100%)', flex);
+    return res.json({ ok: true, sent: true, targetLineUserId: targetId, targetName });
+  } catch (err) {
+    console.error('test-line-notify error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -4577,6 +4788,18 @@ app.post('/api/auth/line-register', async (req, res) => {
       const token = await mintToken('tch_' + teacherId, { role: 'teacher', tid: teacherId });
       logServer('activity', 'คุณครูผูกบัญชีกับ LINE สำเร็จ', (teacher.name || teacherId) + ' (' + lineUserId + ')');
 
+      // ── ส่งการ์ดแจ้งเตือนใน LINE ทันทีเพื่อยืนยันการเชื่อมต่อสำเร็จ ──
+      try {
+        const welcomeFlex = buildLineLinkedFlex({
+          role: 'teacher',
+          name: teacher.name || teacherId,
+          extraInfo: `กลุ่มสาระฯ: ${teacher.department || '-'}`
+        });
+        await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex);
+      } catch (lineErr) {
+        console.warn('Failed to send teacher welcome flex:', lineErr.message);
+      }
+
       return res.json({
         ok: true,
         role: 'teacher',
@@ -4620,6 +4843,18 @@ app.post('/api/auth/line-register', async (req, res) => {
 
         const token = await mintToken('stu_' + id, { role: 'student', sid: id });
         logServer('activity', 'นักเรียนลงทะเบียนใหม่พร้อมผูก LINE สำเร็จ', cleanName + ' (' + id + ')');
+
+        // ── ส่งการ์ดแจ้งเตือนใน LINE ทันทีเพื่อยืนยันการเชื่อมต่อสำเร็จ ──
+        try {
+          const welcomeFlex = buildLineLinkedFlex({
+            role: 'student',
+            name: cleanName,
+            extraInfo: `ชั้น ${studentData.studentClass || '-'} เลขที่ ${studentData.studentNo || '-'}`
+          });
+          await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex);
+        } catch (lineErr) {
+          console.warn('Failed to send student welcome flex:', lineErr.message);
+        }
 
         return res.json({
           ok: true,
@@ -4666,6 +4901,18 @@ app.post('/api/auth/line-register', async (req, res) => {
 
         const token = await mintToken('stu_' + id, { role: 'student', sid: id });
         logServer('activity', 'นักเรียนผูกบัญชีเดิมกับ LINE สำเร็จ', (student.name || id) + ' (' + lineUserId + ')');
+
+        // ── ส่งการ์ดแจ้งเตือนใน LINE ทันทีเพื่อยืนยันการเชื่อมต่อสำเร็จ ──
+        try {
+          const welcomeFlex = buildLineLinkedFlex({
+            role: 'student',
+            name: student.name || id,
+            extraInfo: `ชั้น ${student.studentClass || '-'} เลขที่ ${student.studentNo || '-'}`
+          });
+          await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex);
+        } catch (lineErr) {
+          console.warn('Failed to send student welcome flex:', lineErr.message);
+        }
 
         return res.json({
           ok: true,
