@@ -3200,7 +3200,7 @@ app.get('/api/public-teachers', async (req, res) => {
         isActive: data.isActive !== false,
         isExternalOrFormer: !!data.isExternalOrFormer
       };
-    }).filter(t => t.name.length > 0 && t.isActive && !t.isExternalOrFormer)
+    }).filter(t => t.name.length > 0 && t.isActive && !t.isExternalOrFormer && !t.name.startsWith('[') && t.name.trim().split(/\s+/).length >= 2)
       .sort((a, b) => a.name.localeCompare(b.name, 'th'));
 
     res.json({ ok: true, teachers: list });
