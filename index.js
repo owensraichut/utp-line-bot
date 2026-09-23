@@ -5180,7 +5180,17 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
       }
     });
 
+    // ดึง defective_records ที่มีอยู่แล้วเพื่อตรวจสอบความซ้ำซ้อนและปกป้องสถานะเดิม (Immunity Guard)
+    const defectSnap = await db.collection('defective_records').get();
+    const existingDefectMap = new Map();
+    defectSnap.forEach(doc => {
+      existingDefectMap.set(doc.id, doc.data());
+    });
+
     let recordsSaved = 0;
+    let newRecordsCount = 0;
+    let existingRecordsCount = 0;
+    let protectedRecordsCount = 0;
     let studentsSaved = 0;
 
     // 1. นำเข้า defective_records เป็นชุดละ 400
@@ -5197,7 +5207,15 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
         const docId = `${r.studentId}_${safeCode}_${term}_${year}`;
         const sem = r.semester || `${term}/${year}`;
 
-        // ตรวจสอบคำร้องที่มีอยู่
+        // ตรวจสอบระเบียนที่มีอยู่ใน defective_records
+        const existingDefect = existingDefectMap.get(docId);
+        if (existingDefect) {
+          existingRecordsCount++;
+        } else {
+          newRecordsCount++;
+        }
+
+        // ตรวจสอบคำร้องที่มีอยู่ใน requests
         const sCode = (r.subjectCode || '').replace(/\s+/g, '').toUpperCase();
         const matchedReq = reqMap.get(`${r.studentId}_${sCode}_${sem}`) || (r.subjectName ? reqMap.get(`${r.studentId}_${r.subjectName.trim()}_${sem}`) : null);
 
@@ -5206,11 +5224,21 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
         let newGrade = r.newGrade || null;
         let resolvedAt = r.resolvedAt || null;
 
-        if (matchedReq) {
-          status = matchedReq.status || status;
+        // 🛡️ Immunity Guard 1: ถ้าในคำร้อง (requests) มีการดำเนินการแล้ว ให้นำสถานะปัจจุบันมาใช้
+        if (matchedReq && ['completed', 'teacher_approved', 'pending_teacher', 'assigned_work'].includes(matchedReq.status)) {
+          status = matchedReq.status;
           requestId = matchedReq.id;
           newGrade = matchedReq.newGrade || newGrade;
           resolvedAt = matchedReq.completedAt || matchedReq.updatedAt || resolvedAt;
+          protectedRecordsCount++;
+        }
+        // 🛡️ Immunity Guard 2: ถ้าในระเบียนเดิม (existingDefect) ได้ดำเนินการหรือแก้ไปแล้ว ห้ามย้อนสถานะกลับเป็น unsubmitted
+        else if (existingDefect && ['completed', 'teacher_approved', 'pending_teacher', 'assigned_work'].includes(existingDefect.status)) {
+          status = existingDefect.status;
+          requestId = existingDefect.requestId || requestId;
+          newGrade = existingDefect.newGrade || newGrade;
+          resolvedAt = existingDefect.resolvedAt || resolvedAt;
+          protectedRecordsCount++;
         }
 
         // จับคู่ teacherId
@@ -5277,8 +5305,11 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
     res.json({
       ok: true,
       recordsSaved,
+      newRecordsCount,
+      existingRecordsCount,
+      protectedRecordsCount,
       studentsSaved,
-      message: `นำเข้าข้อมูล SGS สำเร็จ ${recordsSaved} รายการ`
+      message: `บันทึกข้อมูล SGS สำเร็จ ${recordsSaved} รายการ (เพิ่มใหม่ ${newRecordsCount}, ข้อมูลเดิม ${existingRecordsCount}, ล็อกคุ้มครองสถานะที่แก้ไขแล้ว ${protectedRecordsCount} รายการ)`
     });
   } catch (err) {
     console.error('api/admin/batch-import-defects error:', err);
