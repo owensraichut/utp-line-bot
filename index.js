@@ -3515,6 +3515,27 @@ app.post('/api/auth/teacher-change-pin', async (req, res) => {
   }
 });
 
+// ── ครู: บันทึก/ตั้งค่าห้องที่ปรึกษา (Advisory Class) ──────────────
+app.post('/api/auth/teacher-set-advisory', async (req, res) => {
+  try {
+    const { teacherId, advisoryClass } = req.body || {};
+    const id = String(teacherId || '').trim();
+    if (!id) {
+      return res.status(400).json({ error: 'ไม่พบรหัสประจำตัวครู' });
+    }
+    const cleanAdvisory = String(advisoryClass || '').trim();
+    await db.collection('teachers').doc(id).set({
+      advisoryClass: cleanAdvisory,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ ok: true, advisoryClass: cleanAdvisory });
+  } catch (err) {
+    console.error('auth/teacher-set-advisory:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── นักเรียน: เปลี่ยน PIN 4 หลัก ──────────────────────────────────
 app.post('/api/auth/student-change-pin', async (req, res) => {
   try {
