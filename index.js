@@ -18,7 +18,7 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 
 // ── CORS Middleware (Allow Web App Access) ───────────────────────
 app.use((req, res, next) => {
