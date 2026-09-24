@@ -5138,6 +5138,14 @@ app.post('/api/sync-defective-record', async (req, res) => {
   }
 });
 
+// Cache ชั่วคราวสำหรับการนำเข้าข้อมูลเป็นชุด (Batch Import) ลดการ query Firestore ซ้ำซ้อน
+let sgsImportCache = {
+  teacherMap: null,
+  reqMap: null,
+  existingDefectMap: null,
+  lastFetched: 0
+};
+
 // API: แอดมินนำเข้าข้อมูล SGS แบบกลุ่ม (จากหน้าเว็บแอดมิน)
 app.post('/api/admin/batch-import-defects', async (req, res) => {
   try {
@@ -5153,39 +5161,55 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
 
     if (!db) return res.status(500).json({ error: 'Firebase not connected' });
 
-    // ดึงรายชื่อครูทั้งหมดมาจับคู่ ID อัตโนมัติ
-    const teachersSnap = await db.collection('teachers').get();
-    const teacherMap = new Map();
-    teachersSnap.forEach(doc => {
-      const d = doc.data();
-      if (d.name) {
-        const clean = d.name.replace(/\s+/g, ' ').trim();
-        teacherMap.set(clean, doc.id);
-        const stripped = clean.replace(/^(นาย|นางสาว|นาง|ว่าที่ร้อยตรี|ว่าที่ ร\.ต\.|ดร\.|ครู)\s*/, '');
-        if (stripped) teacherMap.set(stripped, doc.id);
-      }
-    });
+    const now = Date.now();
+    let teacherMap, reqMap, existingDefectMap;
 
-    // ดึงคำร้องที่มีอยู่มาเชื่อมโยงสถานะ
-    const reqSnap = await db.collection('requests').get();
-    const reqMap = new Map();
-    reqSnap.forEach(doc => {
-      const d = doc.data();
-      if (d.studentId && d.semester) {
-        const sCode = (d.subjectCode || '').replace(/\s+/g, '').toUpperCase();
-        reqMap.set(`${d.studentId}_${sCode}_${d.semester}`, { id: doc.id, ...d });
-        if (d.subjectName) {
-          reqMap.set(`${d.studentId}_${d.subjectName.trim()}_${d.semester}`, { id: doc.id, ...d });
+    if (sgsImportCache.teacherMap && sgsImportCache.reqMap && sgsImportCache.existingDefectMap && (now - sgsImportCache.lastFetched < 120000)) {
+      teacherMap = sgsImportCache.teacherMap;
+      reqMap = sgsImportCache.reqMap;
+      existingDefectMap = sgsImportCache.existingDefectMap;
+    } else {
+      // ดึงรายชื่อครูทั้งหมดมาจับคู่ ID อัตโนมัติ
+      const teachersSnap = await db.collection('teachers').get();
+      teacherMap = new Map();
+      teachersSnap.forEach(doc => {
+        const d = doc.data();
+        if (d.name) {
+          const clean = d.name.replace(/\s+/g, ' ').trim();
+          teacherMap.set(clean, doc.id);
+          const stripped = clean.replace(/^(นาย|นางสาว|นาง|ว่าที่ร้อยตรี|ว่าที่ ร\.ต\.|ดร\.|ครู)\s*/, '');
+          if (stripped) teacherMap.set(stripped, doc.id);
         }
-      }
-    });
+      });
 
-    // ดึง defective_records ที่มีอยู่แล้วเพื่อตรวจสอบความซ้ำซ้อนและปกป้องสถานะเดิม (Immunity Guard)
-    const defectSnap = await db.collection('defective_records').get();
-    const existingDefectMap = new Map();
-    defectSnap.forEach(doc => {
-      existingDefectMap.set(doc.id, doc.data());
-    });
+      // ดึงคำร้องที่มีอยู่มาเชื่อมโยงสถานะ
+      const reqSnap = await db.collection('requests').get();
+      reqMap = new Map();
+      reqSnap.forEach(doc => {
+        const d = doc.data();
+        if (d.studentId && d.semester) {
+          const sCode = (d.subjectCode || '').replace(/\s+/g, '').toUpperCase();
+          reqMap.set(`${d.studentId}_${sCode}_${d.semester}`, { id: doc.id, ...d });
+          if (d.subjectName) {
+            reqMap.set(`${d.studentId}_${d.subjectName.trim()}_${d.semester}`, { id: doc.id, ...d });
+          }
+        }
+      });
+
+      // ดึง defective_records ที่มีอยู่แล้วเพื่อตรวจสอบความซ้ำซ้อนและปกป้องสถานะเดิม (Immunity Guard)
+      const defectSnap = await db.collection('defective_records').get();
+      existingDefectMap = new Map();
+      defectSnap.forEach(doc => {
+        existingDefectMap.set(doc.id, doc.data());
+      });
+
+      sgsImportCache = {
+        teacherMap,
+        reqMap,
+        existingDefectMap,
+        lastFetched: now
+      };
+    }
 
     let recordsSaved = 0;
     let newRecordsCount = 0;
@@ -5248,8 +5272,7 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
           teacherId = teacherMap.get(tClean) || teacherMap.get(tClean.replace(/^(นาย|นางสาว|นาง|ว่าที่ร้อยตรี|ว่าที่ ร\.ต\.|ดร\.|ครู)\s*/, '')) || null;
         }
 
-        const docRef = db.collection('defective_records').doc(docId);
-        batch.set(docRef, {
+        const recordData = {
           id: docId,
           studentId: String(r.studentId).trim(),
           studentName: r.studentName || '',
@@ -5271,7 +5294,9 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
           newGrade,
           resolvedAt,
           updatedAt: new Date().toISOString()
-        }, { merge: true });
+        };
+        batch.set(docRef, recordData, { merge: true });
+        existingDefectMap.set(docId, recordData);
 
         recordsSaved++;
       }
