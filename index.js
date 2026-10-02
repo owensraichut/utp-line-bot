@@ -6027,6 +6027,7 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
           resolvedAt,
           updatedAt: new Date().toISOString()
         };
+        const docRef = db.collection('defective_records').doc(docId);
         batch.set(docRef, recordData, { merge: true });
         existingDefectMap.set(docId, recordData);
 
