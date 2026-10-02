@@ -2177,20 +2177,79 @@ app.post('/notify-teacher', async (req, res) => {
 
     const teacherDoc = await db.collection('teachers').doc(teacherId).get();
     if (!teacherDoc.exists) return res.status(404).json({ error: 'Teacher not found' });
-
-    const lineUserId = teacherDoc.data().lineUserId;
-    if (!lineUserId) {
-      console.log(`Teacher ${teacherId} has no LINE User ID set`);
-      return res.json({ sent: false, reason: 'Teacher has no LINE User ID set' });
-    }
+    const teacherData = teacherDoc.data() || {};
 
     // สร้าง Magic Link เฉพาะของครูคนนี้ พร้อมเจาะจง request ID
     const magicUrl = generateMagicLink(teacherId, requestId || reqData.id);
-    const flex = buildTeacherFlex(reqData, magicUrl);
-    const altText = '📋 คำร้องใหม่: ' + reqData.studentName + ' ขอแก้ไขวิชา ' + reqData.subjectCode + ' (' + reqData.gradeType + ')';
 
-    await sendLineFlexMessage(lineUserId, altText, flex);
-    res.json({ sent: true, teacherId, lineUserId });
+    // 1. ส่งอีเมลแจ้งเตือนคุณครู (หรือ sirachut@utp.ac.th เพื่อให้งานวัดผลรับทราบหากครูยังไม่ได้ระบุอีเมล)
+    const targetEmail = (teacherData.email && teacherData.email.includes('@')) ? teacherData.email.trim() : 'sirachut@utp.ac.th';
+    const emailSubject = `[UTP SGS] คำร้องใหม่: ${reqData.studentName || 'นักเรียน'} ขอแก้ ${reqData.subjectCode} (${reqData.gradeType})`;
+    const emailHtml = `
+      <div style="font-family: 'Sarabun', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #334155;">
+        <div style="background: linear-gradient(135deg, #1e3a8a, #3b82f6); padding: 24px; text-align: center;">
+          <h2 style="margin: 0; color: #ffffff; font-size: 20px; font-weight: 700;">📋 คำร้องขอแก้ไขผลการเรียนใหม่</h2>
+          <p style="margin: 6px 0 0; color: #bfdbfe; font-size: 13px;">ระบบบริหารจัดการผลการเรียน โรงเรียนอุเทนพัฒนา (UTP SGS)</p>
+        </div>
+        <div style="padding: 24px;">
+          <p style="font-size: 15px; color: #e2e8f0; margin-top: 0;">เรียน <strong>${teacherData.name || 'คุณครูผู้สอน'}</strong>,</p>
+          <p style="font-size: 14px; color: #94a3b8; line-height: 1.6;">มีนักเรียนยื่นคำร้องขอแก้ไขผลการเรียน <strong>ติด ${reqData.gradeType}</strong> ในรายวิชาของคุณครู โดยมีรายละเอียดดังนี้:</p>
+          
+          <div style="background: #1e293b; border-radius: 12px; padding: 18px; margin: 20px 0; border: 1px solid #334155;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 14px; color: #e2e8f0;">
+              <tr>
+                <td style="padding: 6px 0; color: #94a3b8; width: 110px;">👤 นักเรียน:</td>
+                <td style="padding: 6px 0; font-weight: bold; color: #ffffff;">${reqData.studentName || '-'}</td>
+              </tr>
+              <tr>
+                <td style="padding: 6px 0; color: #94a3b8;">🆔 รหัสนักเรียน:</td>
+                <td style="padding: 6px 0; font-family: monospace; color: #38bdf8;">${reqData.studentId || '-'} (ชั้น ${reqData.studentClass || '-'})</td>
+              </tr>
+              <tr>
+                <td style="padding: 6px 0; color: #94a3b8;">📚 รายวิชา:</td>
+                <td style="padding: 6px 0; font-weight: bold; color: #ffffff;">${reqData.subjectCode} - ${reqData.subjectName || '-'}</td>
+              </tr>
+              <tr>
+                <td style="padding: 6px 0; color: #94a3b8;">⚠️ ผลเดิม:</td>
+                <td style="padding: 6px 0; color: #ef4444; font-weight: bold;">เกรด ${reqData.gradeType} (ภาคเรียน ${reqData.semester || '-'})</td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="text-align: center; margin: 30px 0 20px;">
+            <a href="${magicUrl}" style="display: inline-block; background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #ffffff; text-decoration: none; padding: 14px 28px; border-radius: 10px; font-weight: bold; font-size: 15px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);">
+              🚀 ตรวจสอบและให้เกรดทันที (1-Click Auto Login)
+            </a>
+            <p style="font-size: 12px; color: #64748b; margin-top: 10px;">คลิกปุ่มเพื่อเข้าห้องทำงานและอนุมัติเกรดได้ทันที (ลิงก์มีอายุ 7 วัน)</p>
+          </div>
+        </div>
+        <div style="background: #090d16; padding: 14px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #1e293b;">
+          งานวัดและประเมินผลการเรียนรู้ โรงเรียนอุเทนพัฒนา
+        </div>
+      </div>
+    `;
+
+    let emailSent = false;
+    try {
+      const emailRes = await sendSystemEmail({ to: targetEmail, subject: emailSubject, htmlText: emailHtml });
+      emailSent = emailRes && emailRes.sent;
+    } catch (eMailErr) {
+      console.warn('Send teacher email warning:', eMailErr.message);
+    }
+
+    // 2. ถ้าครูมีผูก LINE ไว้ ก็ส่ง Flex ควบคู่ไปด้วย
+    const lineUserId = teacherData.lineUserId;
+    if (lineUserId && LINE_TOKEN) {
+      try {
+        const flex = buildTeacherFlex(reqData, magicUrl);
+        const altText = '📋 คำร้องใหม่: ' + reqData.studentName + ' ขอแก้ไขวิชา ' + reqData.subjectCode + ' (' + reqData.gradeType + ')';
+        await sendLineFlexMessage(lineUserId, altText, flex);
+      } catch (lErr) {
+        console.warn('Send teacher LINE flex warning:', lErr.message);
+      }
+    }
+
+    res.json({ sent: true, teacherId, targetEmail, emailSent, lineUserId: lineUserId || null });
   } catch (err) {
     console.error('Notify teacher error:', err);
     res.status(500).json({ error: err.message });
@@ -2233,25 +2292,95 @@ app.post('/notify-student', async (req, res) => {
 
     const studentDoc = await db.collection('students').doc(studentId).get();
     if (!studentDoc.exists) return res.json({ sent: false, reason: 'Student not found' });
+    const studentData = studentDoc.data() || {};
 
-    const lineUserId = studentDoc.data().lineUserId;
-    if (!lineUserId) {
-      return res.json({ sent: false, reason: 'Student has no LINE User ID set' });
+    const statusLabels = {
+      submitted: 'ยื่นคำร้องสำเร็จ รอครูผู้สอนตรวจ',
+      pending_teacher: 'ยื่นคำร้องสำเร็จ รอครูผู้สอนตรวจ',
+      teacher_approved: 'ครูอนุมัติเกรดแล้ว รอฝ่ายวัดผลบันทึก',
+      completed: 'ฝ่ายวัดผลบันทึกลง SGS เสร็จสิ้น!',
+      rejected: 'คำร้องถูกปฏิเสธ',
+      assigned_work: 'ครูสั่งงานแล้ว รอนักเรียนส่งงาน',
+    };
+    const statusText = statusLabels[reqData.status] || reqData.status;
+
+    // 1. ส่งอีเมลหานักเรียนหากมีอีเมลระบุไว้
+    const studentEmail = (studentData.email && studentData.email.includes('@')) ? studentData.email.trim() : null;
+    let emailSent = false;
+    if (studentEmail) {
+      const emailSubject = `[UTP SGS] อัปเดตสถานะคำร้อง: วิชา ${reqData.subjectCode} (${statusText})`;
+      const emailHtml = `
+        <div style="font-family: 'Sarabun', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #334155;">
+          <div style="background: linear-gradient(135deg, #059669, #10b981); padding: 22px; text-align: center;">
+            <h2 style="margin: 0; color: #ffffff; font-size: 18px; font-weight: 700;">📢 แจ้งเตือนความคืบหน้าคำร้อง</h2>
+            <p style="margin: 4px 0 0; color: #d1fae5; font-size: 13px;">ระบบแก้ไขผลการเรียน โรงเรียนอุเทนพัฒนา</p>
+          </div>
+          <div style="padding: 24px;">
+            <p style="font-size: 15px; color: #e2e8f0; margin-top: 0;">สวัสดี <strong>${studentData.name || reqData.studentName}</strong>,</p>
+            <p style="font-size: 14px; color: #94a3b8; line-height: 1.6;">คำร้องขอแก้ไขผลการเรียนของคุณมีการอัปเดตสถานะล่าสุด ดังนี้:</p>
+
+            <div style="background: #1e293b; border-radius: 12px; padding: 18px; margin: 18px 0; border: 1px solid #334155;">
+              <table style="width: 100%; border-collapse: collapse; font-size: 14px; color: #e2e8f0;">
+                <tr>
+                  <td style="padding: 6px 0; color: #94a3b8; width: 110px;">📚 วิชา:</td>
+                  <td style="padding: 6px 0; font-weight: bold; color: #ffffff;">${reqData.subjectCode} - ${reqData.subjectName || '-'}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 0; color: #94a3b8;">📊 สถานะ:</td>
+                  <td style="padding: 6px 0; font-weight: bold; color: #38bdf8;">${statusText}</td>
+                </tr>
+                ${reqData.newGrade ? `
+                <tr>
+                  <td style="padding: 6px 0; color: #94a3b8;">🎯 เกรดใหม่:</td>
+                  <td style="padding: 6px 0; font-weight: bold; color: #4ade80; font-size: 16px;">${reqData.newGrade}</td>
+                </tr>` : ''}
+                ${reqData.assignmentDetails ? `
+                <tr>
+                  <td style="padding: 6px 0; color: #94a3b8;">📝 งานที่สั่ง:</td>
+                  <td style="padding: 6px 0; color: #facc15;">${reqData.assignmentDetails}</td>
+                </tr>` : ''}
+              </table>
+              ${reqData.assignmentLink ? `
+                <div style="margin-top: 14px; text-align: center;">
+                  <a href="${reqData.assignmentLink}" style="display: inline-block; background: #7c3aed; color: #ffffff; text-decoration: none; padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: bold;">
+                    🔗 เปิดดูรายละเอียดงานที่ครูมอบหมาย
+                  </a>
+                </div>
+              ` : ''}
+            </div>
+
+            <div style="text-align: center; margin: 24px 0 10px;">
+              <a href="${BASE_URL}/?page=student-status" style="display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 10px; font-size: 14px; font-weight: bold;">
+                🌐 เข้าสู่ระบบเพื่อดูสถานะทั้งหมด
+              </a>
+            </div>
+          </div>
+          <div style="background: #090d16; padding: 12px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #1e293b;">
+            งานวัดและประเมินผลการเรียนรู้ โรงเรียนอุเทนพัฒนา
+          </div>
+        </div>
+      `;
+      try {
+        const mailRes = await sendSystemEmail({ to: studentEmail, subject: emailSubject, htmlText: emailHtml });
+        emailSent = mailRes && mailRes.sent;
+      } catch (sMailErr) {
+        console.warn('Send student email warning:', sMailErr.message);
+      }
     }
 
-    const flex = buildStudentFlex(reqData);
-    const statusLabels = {
-      submitted: 'ยื่นคำร้องสำเร็จ',
-      pending_teacher: 'ยื่นคำร้องสำเร็จ',
-      teacher_approved: 'ครูอนุมัติเกรดแล้ว',
-      completed: 'ดำเนินการเสร็จสิ้น',
-      rejected: 'คำร้องถูกปฏิเสธ',
-      assigned_work: 'ครูสั่งงานแล้ว',
-    };
-    const altText = (statusLabels[reqData.status] || reqData.status) + ': วิชา ' + reqData.subjectCode;
+    // 2. ถ้ามี LINE ก็ส่ง LINE flex ควบคู่ไปด้วย
+    const lineUserId = studentData.lineUserId;
+    if (lineUserId && LINE_TOKEN) {
+      try {
+        const flex = buildStudentFlex(reqData);
+        const altText = (statusLabels[reqData.status] || reqData.status) + ': วิชา ' + reqData.subjectCode;
+        await sendLineFlexMessage(lineUserId, altText, flex);
+      } catch (sLineErr) {
+        console.warn('Send student LINE flex warning:', sLineErr.message);
+      }
+    }
 
-    await sendLineFlexMessage(lineUserId, altText, flex);
-    res.json({ sent: true, studentId, lineUserId });
+    res.json({ sent: true, studentId, studentEmail, emailSent, lineUserId: lineUserId || null });
   } catch (err) {
     console.error('Notify student error:', err);
     res.status(500).json({ error: err.message });
@@ -2285,54 +2414,143 @@ app.post('/notify-staff', async (req, res) => {
         if (snap.exists) reqData = snap.data();
       }
       if (reqData) {
-        await notifyStaffGradeChanged(reqData, prevGrade, newGrade, teacherName || 'คุณครู');
+        try {
+          await notifyStaffGradeChanged(reqData, prevGrade, newGrade, teacherName || 'คุณครู');
+        } catch (e) {}
+
+        // ส่งอีเมลแจ้งเตือนฝ่ายวัดผล (sirachut@utp.ac.th)
+        try {
+          const adminEmail = 'sirachut@utp.ac.th';
+          const adminSubject = `[UTP SGS] มีการแก้ไขเกรดหลังอนุมัติ: ${reqData.studentName} (${reqData.subjectCode}) โดย ${teacherName || 'คุณครู'}`;
+          const adminHtml = `
+            <div style="font-family: 'Sarabun', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #334155;">
+              <div style="background: linear-gradient(135deg, #b91c1c, #ef4444); padding: 22px; text-align: center;">
+                <h2 style="margin: 0; color: #ffffff; font-size: 18px; font-weight: 700;">⚠️ มีการแก้ไขเกรดหลังอนุมัติแล้ว</h2>
+                <p style="margin: 4px 0 0; color: #fee2e2; font-size: 13px;">ระบบแก้ไขผลการเรียน โรงเรียนอุเทนพัฒนา</p>
+              </div>
+              <div style="padding: 24px;">
+                <p style="font-size: 15px; color: #e2e8f0; margin-top: 0;">เรียน <strong>ฝ่ายวัดและประเมินผลการเรียนรู้</strong>,</p>
+                <p style="font-size: 14px; color: #94a3b8; line-height: 1.6;">คุณครู ${teacherName || reqData.teacherName || 'ผู้สอน'} ได้ทำการเปลี่ยนเกรดที่เคยอนุมัติไว้ กรุณาตรวจสอบให้ตรงกับใน SGS:</p>
+                <div style="background: #1e293b; border-radius: 12px; padding: 18px; margin: 18px 0; border: 1px solid #334155;">
+                  <p style="margin: 4px 0; color: #e2e8f0;">👤 นักเรียน: <strong>${reqData.studentName}</strong> (รหัส ${reqData.studentId} ชั้น ${reqData.studentClass || '-'})</p>
+                  <p style="margin: 4px 0; color: #e2e8f0;">📚 วิชา: <strong>${reqData.subjectCode} - ${reqData.subjectName || '-'}</strong></p>
+                  <p style="margin: 4px 0; color: #f87171; font-weight: bold;">🔄 การเปลี่ยนเกรด: เกรดเดิมที่อนุมัติ ${prevGrade || '-'} ➔ เกรดใหม่ ${newGrade || '-'}</p>
+                </div>
+                <div style="text-align: center; margin: 24px 0 10px;">
+                  <a href="${BASE_URL}/?tab=pending" style="display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 10px; font-size: 14px; font-weight: bold;">
+                    🌐 เปิดตรวจสอบบนระบบ SGS
+                  </a>
+                </div>
+              </div>
+            </div>
+          `;
+          await sendSystemEmail({ to: adminEmail, subject: adminSubject, htmlText: adminHtml });
+        } catch (e) {}
+
         return res.json({ sent: true, action: 'grade_changed' });
       }
     }
 
     if (action === 'teacher_approved') {
-      // เมื่อครูอนุมัติเกรด ส่งแจ้งเตือนไปยังเจ้าหน้าที่วัดผล (staffLineIds) ทันที
+      // เมื่อครูอนุมัติเกรด ส่งแจ้งเตือนไปยังเจ้าหน้าที่วัดผล (staffLineIds + email sirachut@utp.ac.th) ทันที
       let reqData = null;
       if (requestId) {
         const snap = await db.collection('requests').doc(requestId).get();
         if (snap.exists) reqData = snap.data();
       }
       if (reqData) {
-        const targets = await staffLineIds();
-        const flex = {
-          type: 'bubble', size: 'kilo',
-          header: {
-            type: 'box', layout: 'vertical', backgroundColor: '#1E40AF', paddingAll: '12px',
-            contents: [{ type: 'text', text: '📥 ครูอนุมัติเกรดแล้ว (รอวัดผล)', color: '#FFFFFF', weight: 'bold', size: 'sm' }]
-          },
-          body: {
-            type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '14px',
-            contents: [
-              { type: 'text', text: reqData.studentName || '-', weight: 'bold', size: 'md' },
-              { type: 'text', text: `รหัส ${reqData.studentId} · ชั้น ${reqData.studentClass || '-'}`, size: 'xs', color: '#6B7280' },
-              { type: 'separator', margin: 'sm' },
-              { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.subjectName || '-'})`, size: 'xs', wrap: true },
-              { type: 'text', text: `เกรด: ${reqData.gradeType} → เกรดใหม่: ${reqData.newGrade || '-'}`, size: 'xs', color: '#16A34A', weight: 'bold' },
-              { type: 'text', text: `ครูผู้สอน: ${teacherName || reqData.teacherName || '-'}`, size: 'xs', color: '#4B5563' }
-            ]
-          },
-          footer: {
-            type: 'box', layout: 'vertical', paddingAll: '10px',
-            contents: [
-              { type: 'button', style: 'primary', color: '#1E40AF', height: 'sm',
-                action: { type: 'uri', label: '🌐 เปิดระบบ SGS เพื่อบันทึก', uri: `${BASE_URL}/?tab=pending` } }
-            ]
+        // 1. ส่งอีเมลหาฝ่ายวัดผล sirachut@utp.ac.th
+        try {
+          const adminEmail = 'sirachut@utp.ac.th';
+          const adminSubject = `[UTP SGS] ครูอนุมัติเกรดแล้ว: ${reqData.studentName} (${reqData.subjectCode}) รอลง SGS`;
+          const adminHtml = `
+            <div style="font-family: 'Sarabun', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #334155;">
+              <div style="background: linear-gradient(135deg, #1e40af, #2563eb); padding: 22px; text-align: center;">
+                <h2 style="margin: 0; color: #ffffff; font-size: 18px; font-weight: 700;">📥 ครูอนุมัติผลการเรียนแล้ว (รอดำเนินการใน SGS)</h2>
+                <p style="margin: 4px 0 0; color: #bfdbfe; font-size: 13px;">ระบบแก้ไขผลการเรียน โรงเรียนอุเทนพัฒนา</p>
+              </div>
+              <div style="padding: 24px;">
+                <p style="font-size: 15px; color: #e2e8f0; margin-top: 0;">เรียน <strong>ฝ่ายวัดและประเมินผลการเรียนรู้</strong>,</p>
+                <p style="font-size: 14px; color: #94a3b8; line-height: 1.6;">คุณครูผู้สอนได้ทำการอนุมัติผลการเรียนใหม่เรียบร้อยแล้ว กรุณาดำเนินการตรวจสอบและบันทึกลงระบบ SGS:</p>
+
+                <div style="background: #1e293b; border-radius: 12px; padding: 18px; margin: 18px 0; border: 1px solid #334155;">
+                  <table style="width: 100%; border-collapse: collapse; font-size: 14px; color: #e2e8f0;">
+                    <tr>
+                      <td style="padding: 6px 0; color: #94a3b8; width: 110px;">👤 นักเรียน:</td>
+                      <td style="padding: 6px 0; font-weight: bold; color: #ffffff;">${reqData.studentName || '-'}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 6px 0; color: #94a3b8;">🆔 รหัสนักเรียน:</td>
+                      <td style="padding: 6px 0; font-family: monospace; color: #38bdf8;">${reqData.studentId} (ชั้น ${reqData.studentClass || '-'})</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 6px 0; color: #94a3b8;">📚 รายวิชา:</td>
+                      <td style="padding: 6px 0; font-weight: bold; color: #ffffff;">${reqData.subjectCode} (${reqData.subjectName || '-'})</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 6px 0; color: #94a3b8;">📈 เกรดที่แก้:</td>
+                      <td style="padding: 6px 0; font-weight: bold; color: #4ade80;">เดิม ${reqData.gradeType} ➔ เกรดใหม่: ${reqData.newGrade || '-'}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 6px 0; color: #94a3b8;">👨‍🏫 ครูผู้สอน:</td>
+                      <td style="padding: 6px 0; color: #e2e8f0;">${teacherName || reqData.teacherName || '-'}</td>
+                    </tr>
+                  </table>
+                </div>
+
+                <div style="text-align: center; margin: 26px 0 10px;">
+                  <a href="${BASE_URL}/?tab=pending" style="display: inline-block; background: #1e40af; color: #ffffff; text-decoration: none; padding: 12px 26px; border-radius: 10px; font-size: 14px; font-weight: bold;">
+                    🌐 เปิดระบบเพื่อบันทึกผลลง SGS
+                  </a>
+                </div>
+              </div>
+              <div style="background: #090d16; padding: 12px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #1e293b;">
+                งานวัดและประเมินผลการเรียนรู้ โรงเรียนอุเทนพัฒนา
+              </div>
+            </div>
+          `;
+          await sendSystemEmail({ to: adminEmail, subject: adminSubject, htmlText: adminHtml });
+        } catch (e) {}
+
+        // 2. ถ้ามี LINE ก็ส่ง LINE flex ด้วย
+        try {
+          const targets = await staffLineIds();
+          const flex = {
+            type: 'bubble', size: 'kilo',
+            header: {
+              type: 'box', layout: 'vertical', backgroundColor: '#1E40AF', paddingAll: '12px',
+              contents: [{ type: 'text', text: '📥 ครูอนุมัติเกรดแล้ว (รอวัดผล)', color: '#FFFFFF', weight: 'bold', size: 'sm' }]
+            },
+            body: {
+              type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '14px',
+              contents: [
+                { type: 'text', text: reqData.studentName || '-', weight: 'bold', size: 'md' },
+                { type: 'text', text: `รหัส ${reqData.studentId} · ชั้น ${reqData.studentClass || '-'}`, size: 'xs', color: '#6B7280' },
+                { type: 'separator', margin: 'sm' },
+                { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.subjectName || '-'})`, size: 'xs', wrap: true },
+                { type: 'text', text: `เกรด: ${reqData.gradeType} → เกรดใหม่: ${reqData.newGrade || '-'}`, size: 'xs', color: '#16A34A', weight: 'bold' },
+                { type: 'text', text: `ครูผู้สอน: ${teacherName || reqData.teacherName || '-'}`, size: 'xs', color: '#4B5563' }
+              ]
+            },
+            footer: {
+              type: 'box', layout: 'vertical', paddingAll: '10px',
+              contents: [
+                { type: 'button', style: 'primary', color: '#1E40AF', height: 'sm',
+                  action: { type: 'uri', label: '🌐 เปิดระบบ SGS เพื่อบันทึก', uri: `${BASE_URL}/?tab=pending` } }
+              ]
+            }
+          };
+          for (const staffId of targets) {
+            await sendLineFlexMessage(staffId, `ครูอนุมัติเกรด ${reqData.studentName} (${reqData.subjectCode}) รอดำเนินการ`, flex);
           }
-        };
-        for (const staffId of targets) {
-          await sendLineFlexMessage(staffId, `ครูอนุมัติเกรด ${reqData.studentName} (${reqData.subjectCode}) รอดำเนินการ`, flex);
-        }
-        return res.json({ sent: true, action: 'teacher_approved', targets: targets.length });
+        } catch (e) {}
+
+        return res.json({ sent: true, action: 'teacher_approved' });
       }
     }
 
     if (action === 'completed') {
-      // ฝ่ายวัดผลบันทึกลง SGS สำเร็จ -> แจ้งเตือนครูผู้สอนทราบ
+      // ฝ่ายวัดผลบันทึกลง SGS สำเร็จ -> แจ้งเตือนครูผู้สอนทราบ (ทางอีเมล & LINE)
       let reqData = null;
       if (requestId) {
         const snap = await db.collection('requests').doc(requestId).get();
@@ -2340,24 +2558,55 @@ app.post('/notify-staff', async (req, res) => {
       }
       if (reqData && reqData.teacherId) {
         const tchDoc = await db.collection('teachers').doc(reqData.teacherId).get();
-        if (tchDoc.exists && tchDoc.data().lineUserId) {
-          const flex = {
-            type: 'bubble', size: 'kilo',
-            header: {
-              type: 'box', layout: 'vertical', backgroundColor: '#059669', paddingAll: '12px',
-              contents: [{ type: 'text', text: '✅ บันทึกเกรดลง SGS เรียบร้อยแล้ว', color: '#FFFFFF', weight: 'bold', size: 'sm' }]
-            },
-            body: {
-              type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '14px',
-              contents: [
-                { type: 'text', text: reqData.studentName || '-', weight: 'bold', size: 'md' },
-                { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.subjectName || '-'})`, size: 'xs', wrap: true },
-                { type: 'text', text: `ผลการเรียน: ${reqData.gradeType} → ${reqData.newGrade || '-'}`, size: 'xs', color: '#059669', weight: 'bold' },
-                { type: 'text', text: 'ฝ่ายวัดผลได้บันทึกคะแนน/ผลการเรียนลงในระบบ SGS เรียบร้อยแล้ว', size: 'xs', color: '#4B5563', wrap: true }
-              ]
-            }
-          };
-          await sendLineFlexMessage(tchDoc.data().lineUserId, `ฝ่ายวัดผลบันทึกผลการเรียน ${reqData.studentName} ลง SGS แล้ว`, flex);
+        if (tchDoc.exists) {
+          const tchData = tchDoc.data();
+          // ส่งอีเมลหาครู
+          const teacherEmail = (tchData.email && tchData.email.includes('@')) ? tchData.email.trim() : null;
+          if (teacherEmail) {
+            try {
+              const compSubject = `[UTP SGS] บันทึกเกรดลง SGS เรียบร้อยแล้ว: ${reqData.studentName} (${reqData.subjectCode})`;
+              const compHtml = `
+                <div style="font-family: 'Sarabun', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #334155;">
+                  <div style="background: linear-gradient(135deg, #059669, #10b981); padding: 22px; text-align: center;">
+                    <h2 style="margin: 0; color: #ffffff; font-size: 18px; font-weight: 700;">✅ บันทึกผลการเรียนลง SGS เสร็จสิ้น</h2>
+                    <p style="margin: 4px 0 0; color: #d1fae5; font-size: 13px;">ระบบแก้ไขผลการเรียน โรงเรียนอุเทนพัฒนา</p>
+                  </div>
+                  <div style="padding: 24px;">
+                    <p style="font-size: 15px; color: #e2e8f0; margin-top: 0;">เรียน <strong>${tchData.name || 'คุณครูผู้สอน'}</strong>,</p>
+                    <p style="font-size: 14px; color: #94a3b8; line-height: 1.6;">ฝ่ายวัดและประเมินผลการเรียนรู้ ได้ดำเนินการบันทึกเกรดใหม่ของนักเรียนลงในระบบ SGS เรียบร้อยแล้ว:</p>
+                    <div style="background: #1e293b; border-radius: 12px; padding: 18px; margin: 18px 0; border: 1px solid #334155;">
+                      <p style="margin: 4px 0; color: #e2e8f0;">👤 นักเรียน: <strong>${reqData.studentName}</strong> (รหัส ${reqData.studentId})</p>
+                      <p style="margin: 4px 0; color: #e2e8f0;">📚 วิชา: <strong>${reqData.subjectCode} - ${reqData.subjectName || '-'}</strong></p>
+                      <p style="margin: 4px 0; color: #4ade80; font-weight: bold;">🎯 ผลการเรียน: เดิม ${reqData.gradeType} ➔ เกรดใหม่: ${reqData.newGrade || '-'}</p>
+                    </div>
+                  </div>
+                </div>
+              `;
+              await sendSystemEmail({ to: teacherEmail, subject: compSubject, htmlText: compHtml });
+            } catch (e) {}
+          }
+
+          if (tchData.lineUserId) {
+            try {
+              const flex = {
+                type: 'bubble', size: 'kilo',
+                header: {
+                  type: 'box', layout: 'vertical', backgroundColor: '#059669', paddingAll: '12px',
+                  contents: [{ type: 'text', text: '✅ บันทึกเกรดลง SGS เรียบร้อยแล้ว', color: '#FFFFFF', weight: 'bold', size: 'sm' }]
+                },
+                body: {
+                  type: 'box', layout: 'vertical', spacing: 'xs', paddingAll: '14px',
+                  contents: [
+                    { type: 'text', text: reqData.studentName || '-', weight: 'bold', size: 'md' },
+                    { type: 'text', text: `วิชา: ${reqData.subjectCode} (${reqData.subjectName || '-'})`, size: 'xs', wrap: true },
+                    { type: 'text', text: `ผลการเรียน: ${reqData.gradeType} → ${reqData.newGrade || '-'}`, size: 'xs', color: '#059669', weight: 'bold' },
+                    { type: 'text', text: 'ฝ่ายวัดผลได้บันทึกคะแนน/ผลการเรียนลงในระบบ SGS เรียบร้อยแล้ว', size: 'xs', color: '#4B5563', wrap: true }
+                  ]
+                }
+              };
+              await sendLineFlexMessage(tchData.lineUserId, `ฝ่ายวัดผลบันทึกผลการเรียน ${reqData.studentName} ลง SGS แล้ว`, flex);
+            } catch (e) {}
+          }
         }
       }
       return res.json({ sent: true, action: 'completed' });
@@ -2368,6 +2617,97 @@ app.post('/notify-staff', async (req, res) => {
     res.json({ sent: true, action: 'digest', result });
   } catch (err) {
     console.error('Notify staff error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/test-email-notify (ทดสอบการส่งอีเมลแจ้งเตือนจริง)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/test-email-notify', async (req, res) => {
+  try {
+    const auth = await authorizeNotify(req);
+    let targetEmail = req.body?.email;
+    let targetName = req.body?.name || '';
+    let targetRole = req.body?.role || '';
+
+    if (!targetEmail && auth?.claims) {
+      const c = auth.claims;
+      if (c.role === 'teacher' && c.tid) {
+        const snap = await db.collection('teachers').doc(c.tid).get();
+        if (snap.exists) {
+          targetEmail = snap.data().email;
+          targetName = snap.data().name || '';
+          targetRole = 'คุณครู';
+        }
+      } else if (c.role === 'student' && c.sid) {
+        const snap = await db.collection('students').doc(c.sid).get();
+        if (snap.exists) {
+          targetEmail = snap.data().email;
+          targetName = snap.data().name || '';
+          targetRole = 'นักเรียน';
+        }
+      } else if (c.role === 'admin' || c.role === 'staff') {
+        targetEmail = 'sirachut@utp.ac.th';
+        targetName = 'ผู้ดูแลระบบ / ฝ่ายวัดผล';
+        targetRole = 'ฝ่ายวัดผล';
+      }
+    }
+
+    if (!targetEmail && req.body?.teacherId) {
+      const snap = await db.collection('teachers').doc(req.body.teacherId).get();
+      if (snap.exists) {
+        targetEmail = snap.data().email;
+        targetName = snap.data().name;
+        targetRole = 'คุณครู';
+      }
+    }
+    if (!targetEmail && req.body?.studentId) {
+      const snap = await db.collection('students').doc(req.body.studentId).get();
+      if (snap.exists) {
+        targetEmail = snap.data().email;
+        targetName = snap.data().name;
+        targetRole = 'นักเรียน';
+      }
+    }
+
+    if (!targetEmail) {
+      targetEmail = 'sirachut@utp.ac.th';
+      targetName = targetName || 'ผู้ดูแลระบบ';
+      targetRole = targetRole || 'ฝ่ายวัดผล';
+    }
+
+    const testSubject = `[UTP SGS] 🔔 ทดสอบระบบแจ้งเตือนทางอีเมล (${targetName})`;
+    const testHtml = `
+      <div style="font-family: 'Sarabun', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 550px; margin: 0 auto; background: #0f172a; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #334155;">
+        <div style="background: linear-gradient(135deg, #059669, #10b981); padding: 22px; text-align: center;">
+          <h2 style="margin: 0; color: #ffffff; font-size: 18px; font-weight: 700;">🔔 ทดสอบการแจ้งเตือนทางอีเมล</h2>
+          <p style="margin: 4px 0 0; color: #d1fae5; font-size: 13px;">ระบบ SGS โรงเรียนอุเทนพัฒนา</p>
+        </div>
+        <div style="padding: 24px;">
+          <p style="font-size: 15px; color: #e2e8f0; margin-top: 0;">สวัสดี <strong>${targetName || 'ผู้ใช้งาน'}</strong> ${targetRole ? `(${targetRole})` : ''},</p>
+          <div style="background: #1e293b; border-radius: 12px; padding: 16px; margin: 18px 0; border: 1px solid #334155;">
+            <p style="margin: 0 0 8px; color: #34d399; font-weight: bold; font-size: 15px;">✅ ระบบส่งอีเมลแจ้งเตือนทำงานปกติ 100%</p>
+            <p style="margin: 0; color: #94a3b8; font-size: 13px;">ส่งถึง: <strong>${targetEmail}</strong></p>
+            <p style="margin: 4px 0 0; color: #94a3b8; font-size: 13px;">เวลาทดสอบ: ${new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })}</p>
+          </div>
+          <p style="font-size: 13px; color: #94a3b8; line-height: 1.6;">ระบบพร้อมส่งแจ้งเตือนเมื่อนักเรียนยื่นคำร้อง, เมื่อครูอนุมัติเกรด/สั่งงาน, และเมื่อฝ่ายวัดผลบันทึกลงระบบ SGS เรียบร้อยแล้ว</p>
+          <div style="text-align: center; margin: 24px 0 8px;">
+            <a href="${BASE_URL}" style="display: inline-block; background: #059669; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 10px; font-size: 14px; font-weight: bold;">
+              🌐 เปิดเข้าสู่ระบบ SGS
+            </a>
+          </div>
+        </div>
+        <div style="background: #090d16; padding: 12px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #1e293b;">
+          งานวัดและประเมินผลการเรียนรู้ โรงเรียนอุเทนพัฒนา
+        </div>
+      </div>
+    `;
+
+    const sendRes = await sendSystemEmail({ to: targetEmail, subject: testSubject, htmlText: testHtml });
+    return res.json({ ok: true, sent: !!(sendRes && sendRes.sent), targetEmail, targetName, mode: sendRes?.mode });
+  } catch (err) {
+    console.error('test-email-notify error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2563,16 +2903,17 @@ async function sendSystemEmail({ to, subject, htmlText }) {
     } catch (e) {}
   }
 
-  // ส่งผ่าน Google Apps Script (HTTPS Free 500 emails/day ผ่าน Gmail แท้)
+  // ส่งผ่าน Google Apps Script (HTTPS Free 1,500-2,000 emails/day ผ่าน Google Workspace แท้)
   if (gasUrl) {
     try {
       const resp = await axios.post(gasUrl, {
         to,
         subject,
         html: htmlText,
+        htmlBody: htmlText,
         fromName
-      }, { timeout: 10000 });
-      if (resp.data && (resp.data.success || resp.status === 200)) {
+      }, { timeout: 15000, maxRedirects: 5 });
+      if (resp.data && (resp.data.success || resp.data.status === 'success' || resp.status === 200)) {
         console.log(`✅ Email sent via Google Apps Script HTTPS to ${to}`);
         logEvent('EMAIL_SENT_GAS', { to, subject });
         return { sent: true, mode: 'gas' };
@@ -3897,8 +4238,18 @@ app.post('/api/auth/reset-student-pin', async (req, res) => {
     clearFails(key);
 
     const del = admin.firestore.FieldValue.delete();
-    await db.collection('student_secrets').doc(sid).set({ pin: del }, { merge: true });
-    await db.collection('students').doc(sid).set({ pin: del }, { merge: true });
+    await db.collection('student_secrets').doc(sid).set({ pin: del, email: del }, { merge: true });
+    await db.collection('students').doc(sid).set({
+      pin: del,
+      email: del,
+      isActivated: false,
+      activatedAt: null,
+      lineUserId: del,
+      lineDisplayName: del,
+      linePictureUrl: del,
+      lineLinkedAt: del,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
     res.json({ ok: true });
   } catch (err) {
     console.error('auth/reset-student-pin:', err);
@@ -3968,21 +4319,63 @@ app.post('/api/auth/google', async (req, res) => {
     };
 
     const checkStaff = async () => {
-      const SUPER_ADMIN_EMAILS = String(process.env.SUPER_ADMIN_EMAILS || 'sirachut25432@gmail.com')
+      const SUPER_ADMIN_EMAILS = String(process.env.SUPER_ADMIN_EMAILS || 'sirachut25432@gmail.com,sirachut@utp.ac.th')
         .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
       let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
+      if (!isSuperAdmin) {
+        try {
+          const sys = await db.collection('system_config').doc('admin').get();
+          if (sys.exists && sys.data()?.email && String(sys.data().email).trim().toLowerCase() === verifiedEmail) {
+            isSuperAdmin = true;
+          }
+        } catch (e) {}
+      }
+
       const staffSnap = await db.collection('admin_users').where('email', '==', verifiedEmail).limit(1).get();
       let matchedStaff = null;
       if (!staffSnap.empty) {
         const doc = staffSnap.docs[0];
         const d = doc.data();
         if (d.isActive !== false) {
-          matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', role: d.role, email: verifiedEmail };
+          matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', username: d.username, role: d.role, email: verifiedEmail };
           if (d.role === 'super' || doc.id === 'super') isSuperAdmin = true;
         }
       }
       return { isSuperAdmin, matchedStaff };
     };
+
+    // กรณีระบุบทบาทเจ้าหน้าที่/แอดมินโดยตรง (intendedRole === 'staff' || intendedRole === 'admin')
+    if (intendedRole === 'staff' || intendedRole === 'admin') {
+      const { isSuperAdmin, matchedStaff } = await checkStaff();
+      if (isSuperAdmin) {
+        const token = await mintToken('adm_super', { role: 'admin', aid: 'super' });
+        logServer('activity', 'Super Admin เข้าสู่ระบบด้วย Google', 'Super Admin (' + verifiedEmail + ')', { email: verifiedEmail });
+        return res.json({
+          ok: true,
+          role: 'super',
+          token,
+          staff: { id: 'super', name: matchedStaff?.name || 'Super Admin (ผู้ดูแลระบบสูงสุด)', email: verifiedEmail }
+        });
+      }
+      if (matchedStaff) {
+        const token = await mintToken('adm_' + matchedStaff.id, { role: 'staff', aid: matchedStaff.id });
+        logServer('activity', 'เจ้าหน้าที่เข้าสู่ระบบด้วย Google', matchedStaff.name + ' (' + verifiedEmail + ')', { staffId: matchedStaff.id });
+        return res.json({
+          ok: true,
+          role: 'sub',
+          token,
+          staff: matchedStaff
+        });
+      }
+      return res.json({
+        ok: false,
+        needLink: true,
+        role: 'staff',
+        email: verifiedEmail,
+        name: verifiedName,
+        picture: verifiedPicture
+      });
+    }
 
     // กรณีระบุบทบาทนักเรียนโดยตรง (intendedRole === 'student')
     if (intendedRole === 'student') {
@@ -4101,9 +4494,12 @@ app.post('/api/auth/google', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 const handleLinkAccount = async (req, res) => {
   try {
-    const { idToken, linkProof, role, identifier, teacherId: reqTeacherId, phone: reqPhone, pin, name, studentClass, studentNo, isNewStudent } = req.body || {};
-    const cleanId = String(identifier || '').trim();
-    if (!role || (!cleanId && !reqTeacherId) || !isPin(pin)) {
+    const { idToken, linkProof, role, identifier, teacherId: reqTeacherId, phone: reqPhone, pin, name, studentClass, studentNo, isNewStudent, username, password, isSuperAdmin } = req.body || {};
+    const cleanId = String(identifier || username || '').trim();
+    if (!role) {
+      return res.status(400).json({ error: 'กรุณาระบุประเภทบทบาทผู้ใช้งาน' });
+    }
+    if ((role === 'teacher' || role === 'student') && ((!cleanId && !reqTeacherId) || !isPin(pin))) {
       return res.status(400).json({ error: 'กรุณากรอกข้อมูลและ PIN 4 หลักให้ครบถ้วน' });
     }
 
@@ -4273,6 +4669,79 @@ const handleLinkAccount = async (req, res) => {
         token,
         student: { id: sid, name: sDoc.data().name, studentClass: sDoc.data().studentClass, studentNo: sDoc.data().studentNo, email: cleanEmail }
       });
+    } else if (role === 'staff' || role === 'admin') {
+      const cleanPass = String(password || '').trim();
+      const cleanUname = cleanId.toLowerCase();
+      const isSuper = isSuperAdmin || cleanUname === 'admin' || cleanUname === 'super';
+
+      if (!cleanPass) {
+        return res.status(400).json({ error: 'กรุณากรอกรหัสผ่านเพื่อยืนยันการผูกบัญชี' });
+      }
+
+      if (isSuper) {
+        if (tooManyFails('adm:super')) return res.status(429).json({ error: LOCKED_MSG });
+        const sec = await db.collection('admin_secrets').doc('super').get();
+        let stored = sec.exists ? sec.data().passwordHash : '';
+        if (!stored) {
+          const cfg = await db.collection('system_config').doc('admin').get();
+          stored = cfg.exists ? cfg.data().passwordHash || '' : '';
+        }
+        if (!stored || sha256hex(cleanPass) !== stored) {
+          noteFail('adm:super');
+          return res.status(401).json({ error: 'รหัสผ่าน Super Admin ไม่ถูกต้อง' });
+        }
+        clearFails('adm:super');
+
+        await db.collection('system_config').doc('admin').set({ email: cleanEmail }, { merge: true });
+        await db.collection('admin_secrets').doc('super').set({ email: cleanEmail }, { merge: true }).catch(() => {});
+
+        const token = await mintToken('adm_super', { role: 'admin', aid: 'super' });
+        logServer('activity', 'Super Admin ผูกบัญชีอีเมลสำเร็จ', 'Super Admin <' + cleanEmail + '>', { email: cleanEmail });
+
+        return res.json({
+          ok: true,
+          role: 'super',
+          token,
+          staff: { id: 'super', name: 'Super Admin (ผู้ดูแลระบบสูงสุด)', email: cleanEmail }
+        });
+      } else {
+        if (!cleanUname) {
+          return res.status(400).json({ error: 'กรุณาระบุ Username ของเจ้าหน้าที่' });
+        }
+        if (tooManyFails('stf:' + cleanUname)) return res.status(429).json({ error: LOCKED_MSG });
+
+        const snap = await db.collection('admin_users').where('username', '==', cleanUname).limit(1).get();
+        if (snap.empty) {
+          noteFail('stf:' + cleanUname);
+          return res.status(404).json({ error: 'ไม่พบบัญชีผู้ใช้เจ้าหน้าที่นี้ในระบบ' });
+        }
+        const staffDoc = snap.docs[0];
+        const staffId = staffDoc.id;
+        const staffData = staffDoc.data();
+        if (staffData.isActive === false) {
+          return res.status(403).json({ error: 'บัญชีเจ้าหน้าที่นี้ถูกปิดใช้งาน กรุณาติดต่อ Super Admin' });
+        }
+
+        const stored = await readSecret('admin_secrets', 'admin_users', staffId, 'passwordHash');
+        if (!stored || sha256hex(cleanPass) !== stored) {
+          noteFail('stf:' + cleanUname);
+          return res.status(401).json({ error: 'รหัสผ่านเจ้าหน้าที่ไม่ถูกต้อง' });
+        }
+        clearFails('stf:' + cleanUname);
+
+        await db.collection('admin_users').doc(staffId).set({ email: cleanEmail, updatedAt: new Date().toISOString() }, { merge: true });
+        await writeSecret('admin_secrets', staffId, { email: cleanEmail });
+
+        const token = await mintToken('adm_' + staffId, { role: 'staff', aid: staffId });
+        logServer('activity', 'เจ้าหน้าที่ผูกบัญชีอีเมลสำเร็จ', (staffData.name || cleanUname) + ' <' + cleanEmail + '>', { staffId });
+
+        return res.json({
+          ok: true,
+          role: 'sub',
+          token,
+          staff: { id: staffId, name: staffData.name || cleanUname, username: staffData.username, email: cleanEmail }
+        });
+      }
     } else {
       return res.status(400).json({ error: 'บทบาทผู้ใช้งานไม่ถูกต้อง' });
     }
@@ -4284,6 +4753,46 @@ const handleLinkAccount = async (req, res) => {
 
 app.post('/api/auth/google-link', handleLinkAccount);
 app.post('/api/auth/link-account', handleLinkAccount);
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/auth/staff-link-google (เจ้าหน้าที่/Super Admin ผูกบัญชี Google จากแดชบอร์ด)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/auth/staff-link-google', async (req, res) => {
+  try {
+    const c = await callerClaims(req);
+    if (!c || (c.role !== 'admin' && c.role !== 'staff')) {
+      return res.status(403).json({ error: 'ไม่มีสิทธิ์ดำเนินการ ต้องเข้าสู่ระบบเจ้าหน้าที่ก่อน' });
+    }
+
+    const { idToken } = req.body || {};
+    const g = await verifiedGoogleEmail(idToken);
+    if (!g || !g.email) {
+      return res.status(401).json({ error: 'ยืนยันบัญชี Google ไม่สำเร็จ หรือยังไม่ได้ยืนยันอีเมล' });
+    }
+    const cleanEmail = g.email;
+
+    // ตรวจสอบว่ามี staff บัญชีอื่นใช้อีเมลนี้อยู่แล้วหรือไม่
+    const existingStaff = await db.collection('admin_users').where('email', '==', cleanEmail).limit(1).get();
+    if (!existingStaff.empty && existingStaff.docs[0].id !== c.aid) {
+      return res.status(409).json({ error: 'อีเมลนี้ถูกใช้เชื่อมต่อกับบัญชีเจ้าหน้าที่อื่นแล้ว' });
+    }
+
+    if (c.role === 'admin' || c.aid === 'super') {
+      await db.collection('system_config').doc('admin').set({ email: cleanEmail }, { merge: true });
+      await db.collection('admin_secrets').doc('super').set({ email: cleanEmail }, { merge: true }).catch(() => {});
+      logServer('activity', 'Super Admin เชื่อมต่อบัญชี Google', 'Super Admin <' + cleanEmail + '>', { email: cleanEmail });
+      return res.json({ ok: true, email: cleanEmail, role: 'super' });
+    } else {
+      await db.collection('admin_users').doc(c.aid).set({ email: cleanEmail, updatedAt: new Date().toISOString() }, { merge: true });
+      await writeSecret('admin_secrets', c.aid, { email: cleanEmail });
+      logServer('activity', 'เจ้าหน้าที่เชื่อมต่อบัญชี Google', c.aid + ' <' + cleanEmail + '>', { staffId: c.aid });
+      return res.json({ ok: true, email: cleanEmail, role: 'sub' });
+    }
+  } catch (err) {
+    console.error('auth/staff-link-google error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ════════════════════════════════════════════════════════════════
 // ROUTE: POST /api/auth/request-email-otp (ส่ง OTP 6 หลักเข้าอีเมลเพื่อเข้าสู่ระบบ)
@@ -4516,6 +5025,32 @@ app.post('/api/auth/unlink-account', async (req, res) => {
       ]);
       logServer('activity', 'Super Admin ยกเลิกการผูกอีเมลนักเรียน', 'รหัสนักเรียน: ' + targetId, { targetId });
       return res.json({ ok: true, message: 'ยกเลิกการผูกอีเมลเรียบร้อยแล้ว' });
+    }
+
+    if (role === 'staff' || role === 'admin') {
+      if (targetId === 'super' || role === 'admin') {
+        await Promise.all([
+          db.collection('system_config').doc('admin').update({
+            email: admin.firestore.FieldValue.delete()
+          }).catch(() => {}),
+          db.collection('admin_secrets').doc('super').update({
+            email: admin.firestore.FieldValue.delete()
+          }).catch(() => {})
+        ]);
+        logServer('activity', 'ยกเลิกการผูกอีเมล Super Admin', 'Super Admin', {});
+        return res.json({ ok: true, message: 'ยกเลิกการผูกอีเมล Super Admin เรียบร้อยแล้ว' });
+      } else {
+        await Promise.all([
+          db.collection('admin_users').doc(targetId).update({
+            email: admin.firestore.FieldValue.delete()
+          }).catch(() => {}),
+          db.collection('admin_secrets').doc(targetId).update({
+            email: admin.firestore.FieldValue.delete()
+          }).catch(() => {})
+        ]);
+        logServer('activity', 'ยกเลิกการผูกอีเมลเจ้าหน้าที่', 'รหัสเจ้าหน้าที่: ' + targetId, { targetId });
+        return res.json({ ok: true, message: 'ยกเลิกการผูกอีเมลเจ้าหน้าที่เรียบร้อยแล้ว' });
+      }
     }
 
     return res.status(400).json({ error: 'ประเภทบัญชีไม่ถูกต้อง' });
