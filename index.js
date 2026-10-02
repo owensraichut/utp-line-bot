@@ -2845,19 +2845,33 @@ app.post('/api/test-email-notify', async (req, res) => {
     }
 
     if (!targetEmail && req.body?.teacherId) {
-      const snap = await db.collection('teachers').doc(req.body.teacherId).get();
-      if (snap.exists) {
-        targetEmail = snap.data().email;
-        targetName = snap.data().name;
+      const fallbackTeacher = teachersFallbackList.find(t => t.id === req.body.teacherId);
+      if (fallbackTeacher) {
+        targetEmail = fallbackTeacher.email;
+        targetName = fallbackTeacher.name;
         targetRole = 'คุณครู';
+      }
+      if (!targetEmail && db) {
+        try {
+          const snap = await db.collection('teachers').doc(req.body.teacherId).get();
+          if (snap.exists) {
+            targetEmail = snap.data().email;
+            targetName = snap.data().name;
+            targetRole = 'คุณครู';
+          }
+        } catch (e) {}
       }
     }
     if (!targetEmail && req.body?.studentId) {
-      const snap = await db.collection('students').doc(req.body.studentId).get();
-      if (snap.exists) {
-        targetEmail = snap.data().email;
-        targetName = snap.data().name;
-        targetRole = 'นักเรียน';
+      if (db) {
+        try {
+          const snap = await db.collection('students').doc(req.body.studentId).get();
+          if (snap.exists) {
+            targetEmail = snap.data().email;
+            targetName = snap.data().name;
+            targetRole = 'นักเรียน';
+          }
+        } catch (e) {}
       }
     }
 
@@ -2895,7 +2909,7 @@ app.post('/api/test-email-notify', async (req, res) => {
     `;
 
     const sendRes = await sendSystemEmail({ to: targetEmail, subject: testSubject, htmlText: testHtml });
-    return res.json({ ok: true, sent: !!(sendRes && sendRes.sent), targetEmail, targetName, mode: sendRes?.mode });
+    return res.json({ ok: true, sent: !!(sendRes && sendRes.sent), targetEmail, targetName, mode: sendRes?.mode, error: sendRes?.error });
   } catch (err) {
     console.error('test-email-notify error:', err);
     res.status(500).json({ error: err.message });
@@ -3055,17 +3069,17 @@ async function getMailTransporter() {
     mailTransporter = nodemailer.createTransport(isGmail ? {
       service: 'gmail',
       auth: { user, pass },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 15000
+      connectionTimeout: 5000,
+      greetingTimeout: 5000,
+      socketTimeout: 6000
     } : {
       host,
       port,
       secure: port === 465,
       auth: { user, pass },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 15000
+      connectionTimeout: 5000,
+      greetingTimeout: 5000,
+      socketTimeout: 6000
     });
     activeSmtpUser = user;
     console.log(`📧 Mail transporter active for: ${user}`);
@@ -3078,11 +3092,11 @@ async function getMailTransporter() {
 async function sendSystemEmail({ to, subject, htmlText }) {
   const fromName = 'โรงเรียนอุเทนพัฒนา (SGS Smart)';
   
-  // 1. ตรวจสอบ HTTPS Web App Relay (Google Apps Script หรือ Resend ผ่านพอร์ต 443 ซึ่ง Cloud Host ไม่บล็อก)
-  let gasUrl = process.env.GAS_MAIL_URL || '';
+  // 1. ตรวจสอบ HTTPS Web App Relay (Google Apps Script HTTPS พอร์ต 443 — รวดเร็ว ไม่โดนบล็อกพอร์ตโดย Cloud Host ส่งได้ 1,500-2,000 ฉบับ/วัน)
+  let gasUrl = process.env.GAS_MAIL_URL || 'https://script.google.com/macros/s/AKfycbwt7ghX8XhFCfMeLq_PVMsCQwLpGBZj-XAOVhJQ---JWEQTBvKSo3YMJbBS-hxIt6xX/exec';
   let resendApiKey = process.env.RESEND_API_KEY || '';
   
-  if ((!gasUrl && !resendApiKey) && db) {
+  if ((!gasUrl || !resendApiKey) && db) {
     try {
       const snap = await db.collection('system_config').doc('smtp').get();
       if (snap.exists) {
@@ -3096,15 +3110,22 @@ async function sendSystemEmail({ to, subject, htmlText }) {
   // ส่งผ่าน Google Apps Script (HTTPS Free 1,500-2,000 emails/day ผ่าน Google Workspace แท้)
   if (gasUrl) {
     try {
-      const resp = await axios.post(gasUrl, {
-        to,
-        subject,
-        html: htmlText,
-        htmlBody: htmlText,
-        fromName
-      }, { timeout: 15000, maxRedirects: 5 });
-      if (resp.data && (resp.data.success || resp.data.status === 'success' || resp.status === 200)) {
-        console.log(`✅ Email sent via Google Apps Script HTTPS to ${to}`);
+      const resp = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          to,
+          subject,
+          html: htmlText,
+          htmlBody: htmlText,
+          fromName
+        }),
+        signal: AbortSignal.timeout(6000)
+      });
+      // Google Apps Script เมื่อบันทึกและส่งเมลสำเร็จจะตอบ 302 Redirect ไปยัง script.googleusercontent.com หรือ 200
+      if (resp.status === 302 || resp.status === 200 || resp.headers.get('location')) {
+        console.log(`✅ Email sent via Google Apps Script HTTPS to ${to} (status: ${resp.status})`);
         logEvent('EMAIL_SENT_GAS', { to, subject });
         return { sent: true, mode: 'gas' };
       }
@@ -3123,7 +3144,7 @@ async function sendSystemEmail({ to, subject, htmlText }) {
         html: htmlText
       }, {
         headers: { Authorization: `Bearer ${resendApiKey}` },
-        timeout: 10000
+        timeout: 8000
       });
       console.log(`✅ Email sent via Resend HTTPS to ${to}:`, resp.data?.id);
       logEvent('EMAIL_SENT_RESEND', { to, subject, id: resp.data?.id });
@@ -3133,7 +3154,7 @@ async function sendSystemEmail({ to, subject, htmlText }) {
     }
   }
 
-  // 2. ส่งผ่าน SMTP (Nodemailer)
+  // 2. ส่งผ่าน SMTP (Nodemailer) — ใช้งานได้กรณีเซิร์ฟเวอร์เปิดพอร์ต SMTP หรือรันใน Local
   const { transporter, user } = await getMailTransporter();
   const fromAddress = user || 'sirachut25432@gmail.com';
 
