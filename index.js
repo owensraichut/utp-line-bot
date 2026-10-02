@@ -66,6 +66,22 @@ try {
 let inMemoryDashboardCache = null;
 try {
   inMemoryDashboardCache = require('./dashboard_cache.json');
+  if (inMemoryDashboardCache && inMemoryDashboardCache.allRecords) {
+    const sMap = {};
+    const tMap = {};
+    for (const r of inMemoryDashboardCache.allRecords) {
+      if (r.studentId) {
+        if (!sMap[r.studentId]) sMap[r.studentId] = [];
+        sMap[r.studentId].push(r);
+      }
+      if (r.teacherId) {
+        if (!tMap[r.teacherId]) tMap[r.teacherId] = [];
+        tMap[r.teacherId].push(r);
+      }
+    }
+    inMemoryDashboardCache.studentDefectMap = sMap;
+    inMemoryDashboardCache.teacherDefectMap = tMap;
+  }
   console.log(`✅ Loaded pre-aggregated dashboard cache: ${inMemoryDashboardCache.totalStudents} students, ${inMemoryDashboardCache.totalDefects} defects`);
 } catch (e) {
   console.warn('⚠️ Could not load dashboard_cache.json:', e.message);
