@@ -4532,6 +4532,30 @@ const LEGACY_SUPER_ADMIN_HASHES = [
 ];
 let cachedSuperAdminHash = process.env.ADMIN_PASSWORD_HASH || DEFAULT_SUPER_ADMIN_HASH;
 
+// Persistent offline storage for admin credentials
+const ADMIN_SECRETS_FILE = path.join(__dirname, 'admin_secrets_store.json');
+let adminSecretsStore = {};
+try {
+  if (fs.existsSync(ADMIN_SECRETS_FILE)) {
+    adminSecretsStore = JSON.parse(fs.readFileSync(ADMIN_SECRETS_FILE, 'utf8'));
+    console.log('✅ Loaded persistent admin_secrets_store.json');
+  }
+} catch (e) {
+  console.warn('⚠️ Could not load admin_secrets_store.json:', e.message);
+}
+
+function saveAdminSecretToDisk(id, data) {
+  try {
+    adminSecretsStore[id] = { ...(adminSecretsStore[id] || {}), ...data };
+    fs.writeFileSync(ADMIN_SECRETS_FILE, JSON.stringify(adminSecretsStore, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('⚠️ Could not save admin_secrets_store.json:', e.message);
+  }
+}
+
+// Clear any past lockout for Super Admin on boot
+clearFails('adm:super');
+
 const STAFF_FALLBACK_LIST = [
   { id: 'ADM-1', name: 'นายศิรชัช แก้วพิกุล', username: 'owensirachut', email: 'sirachut25432@gmail.com', altEmail: 'owensirachut@gmail.com', isActive: true, passwordHash: DEFAULT_SUPER_ADMIN_HASH },
   { id: 'ADM-2', name: 'นายวุฒิชัย ภูดี', username: 'wuttichai', email: 'wuttichai@gmail.com', isActive: true, passwordHash: DEFAULT_SUPER_ADMIN_HASH }
@@ -4543,27 +4567,30 @@ app.post('/api/auth/admin', async (req, res) => {
     if (!password) return res.status(400).json({ error: 'กรุณากรอกรหัสผ่าน' });
     if (tooManyFails('adm:super')) return res.status(429).json({ error: LOCKED_MSG });
 
-    let stored = cachedSuperAdminHash || DEFAULT_SUPER_ADMIN_HASH;
+    let stored = adminSecretsStore['super']?.passwordHash || cachedSuperAdminHash || DEFAULT_SUPER_ADMIN_HASH;
     if (db) {
       try {
         const sec = await db.collection('admin_secrets').doc('super').get();
         if (sec.exists && sec.data()?.passwordHash) {
           stored = sec.data().passwordHash;
           cachedSuperAdminHash = stored;
+          saveAdminSecretToDisk('super', { passwordHash: stored });
         } else {
           const cfg = await db.collection('system_config').doc('admin').get();
           if (cfg.exists && cfg.data()?.passwordHash) {
             stored = cfg.data().passwordHash;
             cachedSuperAdminHash = stored;
+            saveAdminSecretToDisk('super', { passwordHash: stored });
           }
         }
       } catch (fsErr) {
-        console.warn('Firestore read in auth/admin warning (fallback to default hash):', fsErr.message);
+        console.warn('Firestore read in auth/admin warning (using offline/default hash):', fsErr.message);
       }
     }
 
     const entered = sha256hex(password);
     const isValid = (stored && entered === stored) || 
+                    (adminSecretsStore['super']?.passwordHash && entered === adminSecretsStore['super'].passwordHash) ||
                     entered === DEFAULT_SUPER_ADMIN_HASH || 
                     LEGACY_SUPER_ADMIN_HASHES.includes(entered);
 
@@ -4658,19 +4685,35 @@ app.post('/api/auth/admin-change-password', async (req, res) => {
     // ทั้ง Super Admin และเจ้าหน้าที่ใช้ชื่อฟิลด์ passwordHash เหมือนกัน
     const isSuper = id === 'super';
     const field = 'passwordHash';
-    const stored = await readSecret(
-      'admin_secrets',
-      isSuper ? 'system_config' : 'admin_users',
-      isSuper ? 'admin' : id,
-      field
-    );
-    if (!stored || sha256hex(curr) !== stored) {
+    let stored = isSuper ? (adminSecretsStore['super']?.passwordHash || cachedSuperAdminHash || DEFAULT_SUPER_ADMIN_HASH) : (adminSecretsStore[id]?.passwordHash || null);
+
+    try {
+      const fsStored = await readSecret(
+        'admin_secrets',
+        isSuper ? 'system_config' : 'admin_users',
+        isSuper ? 'admin' : id,
+        field
+      );
+      if (fsStored) stored = fsStored;
+    } catch (e) {
+      console.warn('readSecret during admin-change-password warning (using offline store):', e.message);
+    }
+
+    const entered = sha256hex(curr);
+    const isValid = (stored && entered === stored) ||
+                    (isSuper && (entered === DEFAULT_SUPER_ADMIN_HASH || LEGACY_SUPER_ADMIN_HASHES.includes(entered)));
+
+    if (!isValid) {
       noteFail('pwd:' + id);
       return res.status(401).json({ error: 'รหัสผ่านปัจจุบันไม่ถูกต้อง' });
     }
     clearFails('pwd:' + id);
 
-    await writeSecret('admin_secrets', id, { [field]: sha256hex(next) });
+    const nextHash = sha256hex(next);
+    saveAdminSecretToDisk(id, { [field]: nextHash, updatedAt: new Date().toISOString() });
+    if (isSuper) cachedSuperAdminHash = nextHash;
+
+    await writeSecret('admin_secrets', id, { [field]: nextHash });
     res.json({ ok: true });
   } catch (err) {
     console.error('auth/admin-change-password:', err);
@@ -4796,7 +4839,7 @@ app.post('/api/auth/google', async (req, res) => {
     };
 
     const checkStaff = async () => {
-      const SUPER_ADMIN_EMAILS = String(process.env.SUPER_ADMIN_EMAILS || 'sirachut25432@gmail.com,sirachut@utp.ac.th')
+      const SUPER_ADMIN_EMAILS = String(process.env.SUPER_ADMIN_EMAILS || 'sirachut25432@gmail.com,sirachut@utp.ac.th,owensirachut@gmail.com')
         .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
       let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
       if (isSuperAdmin) {
@@ -5549,7 +5592,7 @@ app.post('/api/auth/verify-email-otp', async (req, res) => {
     }
 
     // 3. เจ้าหน้าที่วัดผล / ซูเปอร์แอดมิน
-    const SUPER_ADMIN_EMAILS = ['sirachut25432@gmail.com'];
+    const SUPER_ADMIN_EMAILS = ['sirachut25432@gmail.com', 'sirachut@utp.ac.th', 'owensirachut@gmail.com'];
     let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
     const adminSnap = await db.collection('admin_users').where('email', '==', verifiedEmail).limit(1).get();
     let matchedAdmin = null;
@@ -5943,7 +5986,7 @@ app.post('/api/auth/line-register', async (req, res) => {
       const teacherId = teacherDoc.id;
       const expectedPin = await effectiveTeacherPin(teacherId);
       if (inputPin !== expectedPin) {
-        return res.status(400).json({ error: 'รหัส PIN ของครูไม่ถูกต้อง (PIN เริ่มต้นคือ 2026)' });
+        return res.status(400).json({ error: 'รหัส PIN ของครูไม่ถูกต้อง' });
       }
 
       await db.collection('teachers').doc(teacherId).update({
