@@ -3621,12 +3621,25 @@ app.post('/api/auth/verify-student-info', async (req, res) => {
       return res.status(400).json({ error: 'กรุณากรอกคำนำหน้า ชื่อ และนามสกุล ให้ครบถ้วน' });
     }
 
-    const doc = await db.collection('students').doc(id).get();
-    if (!doc.exists) {
+    let data = null;
+    if (db) {
+      try {
+        const doc = await db.collection('students').doc(id).get();
+        if (doc && doc.exists) data = doc.data();
+      } catch (fsErr) {
+        console.warn('Firestore read error in verify-student-info (using cache fallback):', fsErr.message);
+      }
+    }
+
+    if (!data && inMemoryDashboardCache && inMemoryDashboardCache.allStudents) {
+      const found = inMemoryDashboardCache.allStudents.find(s => s.id === id);
+      if (found) data = found;
+    }
+
+    if (!data) {
       return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในฐานข้อมูลโรงเรียน' });
     }
 
-    const data = doc.data();
     if (data.isActivated && (data.email || data.lineUserId)) {
       const boundInfo = data.email ? data.email.replace(/(.{2})(.*)(@.*)/, '$1***$3') : (data.lineDisplayName ? `LINE (${data.lineDisplayName})` : 'บัญชีอื่น');
       return res.status(409).json({
@@ -3643,8 +3656,15 @@ app.post('/api/auth/verify-student-info', async (req, res) => {
     }
 
     // นับจำนวนวิชาที่ติด 0, ร, มส
-    const defSnap = await db.collection('defective_records').where('studentId', '==', id).get();
-    const defectCount = defSnap.size;
+    let defectCount = 0;
+    if (inMemoryDashboardCache && inMemoryDashboardCache.studentDefectMap && inMemoryDashboardCache.studentDefectMap[id]) {
+      defectCount = inMemoryDashboardCache.studentDefectMap[id].length;
+    } else if (db) {
+      try {
+        const defSnap = await db.collection('defective_records').where('studentId', '==', id).get();
+        defectCount = defSnap.size;
+      } catch (e) {}
+    }
 
     return res.json({
       ok: true,
@@ -3674,12 +3694,25 @@ app.post('/api/auth/activate-student', async (req, res) => {
       return res.status(400).json({ error: 'กรุณากรอกคำนำหน้า ชื่อ และนามสกุล ให้ครบถ้วน' });
     }
 
-    const doc = await db.collection('students').doc(id).get();
-    if (!doc.exists) {
+    let data = null;
+    if (db) {
+      try {
+        const doc = await db.collection('students').doc(id).get();
+        if (doc && doc.exists) data = doc.data();
+      } catch (fsErr) {
+        console.warn('Firestore read error in activate-student (using cache fallback):', fsErr.message);
+      }
+    }
+
+    if (!data && inMemoryDashboardCache && inMemoryDashboardCache.allStudents) {
+      const found = inMemoryDashboardCache.allStudents.find(s => s.id === id);
+      if (found) data = found;
+    }
+
+    if (!data) {
       return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในฐานข้อมูลโรงเรียน' });
     }
 
-    const data = doc.data();
     if (data.isActivated && (data.email || data.lineUserId)) {
       return res.status(409).json({
         error: 'รหัสนักเรียนนี้เปิดใช้งานและผูกบัญชีไปแล้ว กรุณาเข้าสู่ระบบ หรือติดต่อคุณครูเพื่อขอปลดล็อก'
@@ -3719,11 +3752,17 @@ app.post('/api/auth/activate-student', async (req, res) => {
       updateData.lineLinkedAt = new Date().toISOString();
     }
 
-    await db.collection('students').doc(id).set(updateData, { merge: true });
-    await writeSecret('student_secrets', id, {
-      pin: String(pin).trim(),
-      email: cleanEmail || data.email || ''
-    });
+    if (db) {
+      try {
+        await db.collection('students').doc(id).set(updateData, { merge: true });
+        await writeSecret('student_secrets', id, {
+          pin: String(pin).trim(),
+          email: cleanEmail || data.email || ''
+        });
+      } catch (wErr) {
+        console.warn('Firestore write warning in activate-student (proceeding with token):', wErr.message);
+      }
+    }
 
     const token = await mintToken('stu_' + id, { role: 'student', sid: id });
     logServer('activity', 'นักเรียนเปิดใช้งานบัญชีสำเร็จ', (data.name || id) + ' (' + id + ')' + (cleanEmail ? ` <${cleanEmail}>` : '') + (lineUserId ? ` [LINE: ${lineProfile?.displayName || lineUserId}]` : ''));
