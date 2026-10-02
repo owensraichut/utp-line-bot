@@ -63,6 +63,13 @@ try {
   console.error('❌ Firebase init error:', e.message);
 }
 
+// ── Shield against hung Firestore gRPC connections / quota timeouts ──
+const withFsTimeout = (promise, ms = 2500) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), ms))
+  ]);
+
 // ── Teachers Fallback (Shield against Firestore quota exhaustion) ─
 let teachersFallbackList = [];
 try {
@@ -3508,13 +3515,13 @@ async function readSecret(secretCol, legacyCol, id, field) {
   }
   if (!db) return undefined;
   try {
-    const s = await db.collection(secretCol).doc(String(id)).get();
+    const s = await withFsTimeout(db.collection(secretCol).doc(String(id)).get(), 2000);
     if (s.exists && s.data()[field] !== undefined && s.data()[field] !== '') {
       const val = s.data()[field];
       secretCache.set(cacheKey, { val, exp: Date.now() + SECRET_CACHE_TTL });
       return val;
     }
-    const l = await db.collection(legacyCol).doc(String(id)).get();
+    const l = await withFsTimeout(db.collection(legacyCol).doc(String(id)).get(), 2000);
     if (l.exists && l.data()[field] !== undefined && l.data()[field] !== '') {
       const val = l.data()[field];
       secretCache.set(cacheKey, { val, exp: Date.now() + SECRET_CACHE_TTL });
@@ -3677,11 +3684,14 @@ function matchStudentFullName(dbFullName, inputPrefix, inputFirstName, inputLast
   const firstMatches = dbFirst && cleanFirst && (dbFirst === cleanFirst);
   const lastMatches = dbLast && cleanLast && (dbLast === cleanLast);
 
+  // If first and last name match 100%, allow even if title shifted (e.g. ด.ช. -> นาย as student aged)
+  if (firstMatches && lastMatches) return true;
   if (prefixMatches && firstMatches && lastMatches) return true;
 
   const combinedInput = (normInputPrefix + cleanFirst + cleanLast).replace(/\s+/g, '');
   const combinedDb = (dbPrefix + dbFirst + dbLast).replace(/\s+/g, '');
   if (combinedInput === combinedDb) return true;
+  if ((cleanFirst + cleanLast) === (dbFirst + dbLast)) return true;
 
   return false;
 }
@@ -3699,18 +3709,19 @@ app.post('/api/auth/verify-student-info', async (req, res) => {
     }
 
     let data = null;
-    if (db) {
+    // ⚡ 1. Check in-memory student cache first (<1ms)
+    if (inMemoryDashboardCache && inMemoryDashboardCache.allStudents) {
+      const found = inMemoryDashboardCache.allStudents.find(s => s.id === id);
+      if (found) data = found;
+    }
+
+    if (!data && db) {
       try {
-        const doc = await db.collection('students').doc(id).get();
+        const doc = await withFsTimeout(db.collection('students').doc(id).get(), 2000);
         if (doc && doc.exists) data = doc.data();
       } catch (fsErr) {
         console.warn('Firestore read error in verify-student-info (using cache fallback):', fsErr.message);
       }
-    }
-
-    if (!data && inMemoryDashboardCache && inMemoryDashboardCache.allStudents) {
-      const found = inMemoryDashboardCache.allStudents.find(s => s.id === id);
-      if (found) data = found;
     }
 
     if (!data) {
@@ -3738,7 +3749,7 @@ app.post('/api/auth/verify-student-info', async (req, res) => {
       defectCount = inMemoryDashboardCache.studentDefectMap[id].length;
     } else if (db) {
       try {
-        const defSnap = await db.collection('defective_records').where('studentId', '==', id).get();
+        const defSnap = await withFsTimeout(db.collection('defective_records').where('studentId', '==', id).get(), 2000);
         defectCount = defSnap.size;
       } catch (e) {}
     }
@@ -3937,8 +3948,8 @@ app.post('/api/auth/student', async (req, res) => {
 
     if (!data && db) {
       try {
-        const doc = await db.collection('students').doc(id).get();
-        if (doc.exists) data = doc.data();
+        const doc = await withFsTimeout(db.collection('students').doc(id).get(), 2000);
+        if (doc && doc.exists) data = doc.data();
       } catch (fsErr) {
         console.warn('Firestore student read warning (using in-memory cache):', fsErr.message);
       }
@@ -6165,10 +6176,10 @@ async function handleStudentDefects(req, res) {
 
     if (db) {
       try {
-        const [s, r] = await Promise.all([
+        const [s, r] = await withFsTimeout(Promise.all([
           db.collection('defective_records').where('studentId', '==', studentId).get(),
           db.collection('requests').where('studentId', '==', studentId).get()
-        ]);
+        ]), 2500);
         snapDocs = s.docs;
         reqDocs = r.docs;
       } catch (fsErr) {
@@ -6268,7 +6279,7 @@ async function handleTeacherDefectiveRoster(req, res) {
             }
           }
 
-          const snapshots = await Promise.all(promises);
+          const snapshots = await withFsTimeout(Promise.all(promises), 2500);
           for (const snap of snapshots) {
             snap.forEach(doc => {
               if (!seen.has(doc.id)) {
@@ -6279,7 +6290,7 @@ async function handleTeacherDefectiveRoster(req, res) {
           }
         } else {
           // แอดมินหรือกรณีไม่ระบุครู
-          const snap = await db.collection('defective_records').limit(3000).get();
+          const snap = await withFsTimeout(db.collection('defective_records').limit(3000).get(), 2500);
           snap.forEach(doc => {
             if (!seen.has(doc.id)) {
               seen.add(doc.id);
