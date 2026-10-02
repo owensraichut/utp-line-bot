@@ -6163,6 +6163,23 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
   }
 });
 
+// ── Dashboard Stats Cache (Zero Firestore Read Architecture) ──────
+let inMemoryDashboardCache = null;
+try {
+  inMemoryDashboardCache = require('./dashboard_cache.json');
+  console.log(`✅ Loaded pre-aggregated dashboard cache: ${inMemoryDashboardCache.totalStudents} students, ${inMemoryDashboardCache.totalDefects} defects`);
+} catch (e) {
+  console.warn('⚠️ Could not load dashboard_cache.json:', e.message);
+}
+
+// Endpoint to fetch aggregated dashboard stats (0 Firestore Reads!)
+app.all('/api/admin/dashboard-stats', (req, res) => {
+  if (inMemoryDashboardCache) {
+    return res.json({ ok: true, stats: inMemoryDashboardCache });
+  }
+  res.status(503).json({ error: 'สถิติแดชบอร์ดกำลังเตรียมการ กรุณาลองใหม่อีกครั้ง' });
+});
+
 // ── Health Check ─────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
