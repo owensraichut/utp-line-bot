@@ -21,8 +21,16 @@ const app = express();
 app.use(express.json({ limit: '20mb' }));
 
 // ── CORS Middleware (Allow Web App Access) ───────────────────────
+const ALLOWED_ORIGINS = [
+  'https://utenpatten-sgs.web.app',
+  'https://utenpatten-sgs.firebaseapp.com',
+  'http://localhost:3000',   // dev server
+];
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin || '';
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
@@ -3462,18 +3470,32 @@ app.post('/api/verify-pin-reset', async (req, res) => {
 // และเปลี่ยนเป็นรหัสส่วนตัวได้ทุกเมื่อจากเมนู "PIN" ในห้องทำงานครู
 const DEFAULT_TEACHER_PIN = process.env.DEFAULT_TEACHER_PIN || '2026';
 
+// ⚡ High-speed in-memory secrets cache (ป้องกันความล่าช้าข้ามทวีปของ Firestore)
+const secretCache = new Map();
+const SECRET_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
 // อ่านความลับจาก *_secrets ก่อน ถ้ายังไม่มีค่อย fallback ไปเอกสารเดิม
 // (รองรับช่วงทยอย migrate โดยระบบไม่ล่ม)
 async function readSecret(secretCol, legacyCol, id, field) {
-  if (!db || !id) return undefined;
+  if (!id) return undefined;
+  const cacheKey = `${secretCol}:${id}:${field}`;
+  const cached = secretCache.get(cacheKey);
+  if (cached && Date.now() < cached.exp) {
+    return cached.val;
+  }
+  if (!db) return undefined;
   try {
     const s = await db.collection(secretCol).doc(String(id)).get();
     if (s.exists && s.data()[field] !== undefined && s.data()[field] !== '') {
-      return s.data()[field];
+      const val = s.data()[field];
+      secretCache.set(cacheKey, { val, exp: Date.now() + SECRET_CACHE_TTL });
+      return val;
     }
     const l = await db.collection(legacyCol).doc(String(id)).get();
     if (l.exists && l.data()[field] !== undefined && l.data()[field] !== '') {
-      return l.data()[field];
+      const val = l.data()[field];
+      secretCache.set(cacheKey, { val, exp: Date.now() + SECRET_CACHE_TTL });
+      return val;
     }
   } catch (err) {
     console.warn(`readSecret (${secretCol}/${id}) warning (quota/offline):`, err.message);
@@ -3482,7 +3504,14 @@ async function readSecret(secretCol, legacyCol, id, field) {
 }
 
 async function writeSecret(secretCol, id, patch) {
-  if (!db || !id) return;
+  if (!id) return;
+  // Update in-memory cache immediately
+  if (patch) {
+    for (const [k, v] of Object.entries(patch)) {
+      secretCache.set(`${secretCol}:${id}:${k}`, { val: v, exp: Date.now() + SECRET_CACHE_TTL });
+    }
+  }
+  if (!db) return;
   try {
     await db.collection(secretCol).doc(String(id)).set(
       { ...patch, updatedAt: new Date().toISOString() },
@@ -3877,18 +3906,19 @@ app.post('/api/auth/student', async (req, res) => {
     if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
 
     let data = null;
-    if (db) {
+    // ⚡ 1. Check in-memory student directory first (<1ms)
+    if (inMemoryDashboardCache && inMemoryDashboardCache.allStudents) {
+      const found = inMemoryDashboardCache.allStudents.find(s => s.id === id);
+      if (found) data = found;
+    }
+
+    if (!data && db) {
       try {
         const doc = await db.collection('students').doc(id).get();
         if (doc.exists) data = doc.data();
       } catch (fsErr) {
         console.warn('Firestore student read warning (using in-memory cache):', fsErr.message);
       }
-    }
-
-    if (!data && inMemoryDashboardCache && inMemoryDashboardCache.allStudents) {
-      const found = inMemoryDashboardCache.allStudents.find(s => s.id === id);
-      if (found) data = found;
     }
 
     if (!data) return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในระบบ', notFound: true });
@@ -3926,10 +3956,9 @@ app.post('/api/auth/student', async (req, res) => {
     clearFails(key);
     let email = data.email;
     if (!email) {
-      email = await studentSecret(id, 'email');
-      if (email) {
-        await db.collection('students').doc(id).set({ email }, { merge: true }).catch(() => {});
-      }
+      studentSecret(id, 'email').then(em => {
+        if (em && db) db.collection('students').doc(id).set({ email: em }, { merge: true }).catch(() => {});
+      }).catch(() => {});
     }
 
     const token = await mintToken('stu_' + id, { role: 'student', sid: id });
@@ -3992,8 +4021,47 @@ app.post('/api/auth/student-register', async (req, res) => {
 });
 
 // ── ครู: รายชื่อสาธารณะสำหรับ Dropdown / ค้นหา (ปลอดภัย ไม่มี PIN) ──
+let cachedPublicTeachers = null;
+let lastPublicTeachersSync = 0;
+const PUBLIC_TEACHERS_TTL = 30 * 60 * 1000; // 30 mins
+
 app.get('/api/public-teachers', async (req, res) => {
   try {
+    if (cachedPublicTeachers && (Date.now() - lastPublicTeachersSync < PUBLIC_TEACHERS_TTL)) {
+      return res.json({ ok: true, teachers: cachedPublicTeachers });
+    }
+
+    if (teachersFallbackList && teachersFallbackList.length > 0) {
+      if (!cachedPublicTeachers) {
+        cachedPublicTeachers = teachersFallbackList;
+        lastPublicTeachersSync = Date.now();
+      }
+      res.json({ ok: true, teachers: cachedPublicTeachers });
+
+      // Refresh from Firestore in background
+      if (db) {
+        db.collection('teachers').get().then(snap => {
+          const list = snap.docs.map(d => {
+            const data = d.data();
+            return {
+              id: d.id,
+              name: (data.name || '').trim(),
+              department: (data.department || '').trim(),
+              phone: (data.phone || '').trim(),
+              isActive: data.isActive !== false,
+              isExternalOrFormer: !!data.isExternalOrFormer
+            };
+          }).filter(t => t.name.length > 0 && t.isActive && !t.isExternalOrFormer && !t.name.startsWith('[') && t.name.trim().split(/\s+/).length >= 2)
+            .sort((a, b) => a.name.localeCompare(b.name, 'th'));
+          if (list.length > 0) {
+            cachedPublicTeachers = list;
+            lastPublicTeachersSync = Date.now();
+          }
+        }).catch(err => console.warn('Background teachers sync:', err.message));
+      }
+      return;
+    }
+
     const snap = await db.collection('teachers').get();
     const list = snap.docs.map(d => {
       const data = d.data();
@@ -4001,12 +4069,15 @@ app.get('/api/public-teachers', async (req, res) => {
         id: d.id,
         name: (data.name || '').trim(),
         department: (data.department || '').trim(),
+        phone: (data.phone || '').trim(),
         isActive: data.isActive !== false,
         isExternalOrFormer: !!data.isExternalOrFormer
       };
     }).filter(t => t.name.length > 0 && t.isActive && !t.isExternalOrFormer && !t.name.startsWith('[') && t.name.trim().split(/\s+/).length >= 2)
       .sort((a, b) => a.name.localeCompare(b.name, 'th'));
 
+    cachedPublicTeachers = list;
+    lastPublicTeachersSync = Date.now();
     res.json({ ok: true, teachers: list });
   } catch (err) {
     console.error('auth/public-teachers error:', err);
@@ -4026,21 +4097,8 @@ app.post('/api/auth/teacher-lookup', async (req, res) => {
     let teacherData = null;
     let teacherId = null;
 
-    try {
-      if (db) {
-        const snap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
-        if (!snap.empty) {
-          const tDoc = snap.docs[0];
-          teacherId = tDoc.id;
-          teacherData = tDoc.data();
-        }
-      }
-    } catch (fsErr) {
-      console.warn('Firestore teacher-lookup warning:', fsErr.message);
-    }
-
-    // Shield fallback: If Firestore quota exceeded or not found, check fallback list
-    if (!teacherData && teachersFallbackList && teachersFallbackList.length > 0) {
+    // ⚡ 1. Shield: Instant In-Memory lookup (<1ms)
+    if (teachersFallbackList && teachersFallbackList.length > 0) {
       const found = teachersFallbackList.find(t => String(t.phone || '').replace(/\D/g, '') === phone);
       if (found) {
         teacherId = found.id;
@@ -4048,11 +4106,25 @@ app.post('/api/auth/teacher-lookup', async (req, res) => {
       }
     }
 
+    // ⚡ 2. Only query Firestore if not in fallback list
+    if (!teacherData && db) {
+      try {
+        const snap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
+        if (!snap.empty) {
+          const tDoc = snap.docs[0];
+          teacherId = tDoc.id;
+          teacherData = tDoc.data();
+        }
+      } catch (fsErr) {
+        console.warn('Firestore teacher-lookup warning:', fsErr.message);
+      }
+    }
+
     if (!teacherData) {
       return res.status(404).json({ error: 'ไม่พบเบอร์โทรนี้ในระบบ กรุณาติดต่อฝ่ายวัดผลเพื่อเปิดสิทธิ์' });
     }
 
-    // ครูเข้าได้เสมอ — ยังไม่เคยตั้ง PIN ก็ใช้ PIN ตั้งต้นได้เลย
+    // Fast secret check
     let stored = null;
     try {
       stored = await teacherSecret(teacherId, 'pin');
@@ -4082,19 +4154,19 @@ app.post('/api/auth/teacher', async (req, res) => {
     if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
 
     let tData = null;
-    try {
-      if (db) {
-        const tDoc = await db.collection('teachers').doc(id).get();
-        if (tDoc.exists) tData = tDoc.data();
-      }
-    } catch (fsErr) {
-      console.warn('Firestore teacher doc get warning:', fsErr.message);
-    }
-
-    // Fallback: Check in-memory teachers fallback list
-    if (!tData && teachersFallbackList && teachersFallbackList.length > 0) {
+    // ⚡ 1. Check in-memory teachers fallback list (<1ms)
+    if (teachersFallbackList && teachersFallbackList.length > 0) {
       const found = teachersFallbackList.find(t => t.id === id);
       if (found) tData = found;
+    }
+
+    if (!tData && db) {
+      try {
+        const tDoc = await db.collection('teachers').doc(id).get();
+        if (tDoc.exists) tData = tDoc.data();
+      } catch (fsErr) {
+        console.warn('Firestore teacher doc get warning:', fsErr.message);
+      }
     }
 
     if (!tData) return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครู' });
@@ -4114,13 +4186,11 @@ app.post('/api/auth/teacher', async (req, res) => {
     }
     clearFails(key);
 
-    // ครูที่ยังไม่เคยมีระเบียน PIN — บันทึกค่าตั้งต้นไว้ให้เป็นหลักฐาน (ถ้า Firestore ยังรับ)
+    // ⚡ Non-blocking background write for default PIN
     if (!stored && db) {
-      try {
-        await writeSecret('teacher_secrets', id, { pin: DEFAULT_TEACHER_PIN });
-      } catch (wErr) {
+      writeSecret('teacher_secrets', id, { pin: DEFAULT_TEACHER_PIN }).catch(wErr => {
         console.warn('writeSecret fallback warn:', wErr.message);
-      }
+      });
     }
 
     const token = await mintToken('tch_' + id, { role: 'teacher', tid: id });
@@ -4132,7 +4202,9 @@ app.post('/api/auth/teacher', async (req, res) => {
         id,
         name: tData.name || '',
         department: tData.department || '',
-        email: tData.email || ''
+        email: tData.email || '',
+        phone: tData.phone || '',
+        advisoryClass: tData.advisoryClass || ''
       }
     });
   } catch (err) {
