@@ -53,6 +53,15 @@ try {
   console.error('❌ Firebase init error:', e.message);
 }
 
+// ── Teachers Fallback (Shield against Firestore quota exhaustion) ─
+let teachersFallbackList = [];
+try {
+  teachersFallbackList = require('./teachers_fallback.json');
+  console.log(`✅ Loaded ${teachersFallbackList.length} teachers from fallback file`);
+} catch (e) {
+  console.warn('⚠️ Could not load teachers_fallback.json:', e.message);
+}
+
 // ── Config ──────────────────────────────────────────────────────
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const BASE_URL = process.env.APP_BASE_URL || 'https://utenpatten-sgs.web.app';
@@ -3916,19 +3925,47 @@ app.post('/api/auth/teacher-lookup', async (req, res) => {
     const phone = String(req.body?.phone || '').replace(/\D/g, '');
     if (!phone) return res.status(400).json({ error: 'กรุณากรอกเบอร์โทรศัพท์' });
 
-    const snap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
-    if (snap.empty) {
+    let teacherData = null;
+    let teacherId = null;
+
+    try {
+      if (db) {
+        const snap = await db.collection('teachers').where('phone', '==', phone).limit(1).get();
+        if (!snap.empty) {
+          const tDoc = snap.docs[0];
+          teacherId = tDoc.id;
+          teacherData = tDoc.data();
+        }
+      }
+    } catch (fsErr) {
+      console.warn('Firestore teacher-lookup warning:', fsErr.message);
+    }
+
+    // Shield fallback: If Firestore quota exceeded or not found, check fallback list
+    if (!teacherData && teachersFallbackList && teachersFallbackList.length > 0) {
+      const found = teachersFallbackList.find(t => String(t.phone || '').replace(/\D/g, '') === phone);
+      if (found) {
+        teacherId = found.id;
+        teacherData = found;
+      }
+    }
+
+    if (!teacherData) {
       return res.status(404).json({ error: 'ไม่พบเบอร์โทรนี้ในระบบ กรุณาติดต่อฝ่ายวัดผลเพื่อเปิดสิทธิ์' });
     }
-    const tDoc = snap.docs[0];
-    const teacherId = tDoc.id;
 
     // ครูเข้าได้เสมอ — ยังไม่เคยตั้ง PIN ก็ใช้ PIN ตั้งต้นได้เลย
-    const stored = await teacherSecret(teacherId, 'pin');
+    let stored = null;
+    try {
+      stored = await teacherSecret(teacherId, 'pin');
+    } catch (sErr) {
+      console.warn('Firestore teacherSecret warning:', sErr.message);
+    }
+
     res.json({
       ok: true,
       usingDefaultPin: !stored || stored === DEFAULT_TEACHER_PIN,
-      teacher: { id: teacherId, name: tDoc.data().name || '', department: tDoc.data().department || '' }
+      teacher: { id: teacherId, name: teacherData.name || '', department: teacherData.department || '' }
     });
   } catch (err) {
     console.error('auth/teacher-lookup:', err);
@@ -3946,20 +3983,47 @@ app.post('/api/auth/teacher', async (req, res) => {
     const key = 'tch:' + id;
     if (tooManyFails(key)) return res.status(429).json({ error: LOCKED_MSG });
 
-    const tDoc = await db.collection('teachers').doc(id).get();
-    if (!tDoc.exists) return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครู' });
+    let tData = null;
+    try {
+      if (db) {
+        const tDoc = await db.collection('teachers').doc(id).get();
+        if (tDoc.exists) tData = tDoc.data();
+      }
+    } catch (fsErr) {
+      console.warn('Firestore teacher doc get warning:', fsErr.message);
+    }
 
-    const stored = await teacherSecret(id, 'pin');
+    // Fallback: Check in-memory teachers fallback list
+    if (!tData && teachersFallbackList && teachersFallbackList.length > 0) {
+      const found = teachersFallbackList.find(t => t.id === id);
+      if (found) tData = found;
+    }
+
+    if (!tData) return res.status(404).json({ error: 'ไม่พบข้อมูลคุณครู' });
+
+    let stored = null;
+    try {
+      stored = await teacherSecret(id, 'pin');
+    } catch (sErr) {
+      console.warn('Firestore teacherSecret get warning:', sErr.message);
+    }
+
     const expected = stored || DEFAULT_TEACHER_PIN;
     if (expected !== pin) {
       noteFail(key);
-      logServer('login_fail', 'ครูกรอก PIN ผิด', (tDoc.data().name || id), { teacherId: id });
+      logServer('login_fail', 'ครูกรอก PIN ผิด', (tData.name || id), { teacherId: id });
       return res.status(401).json({ error: 'รหัส PIN ไม่ถูกต้อง' });
     }
     clearFails(key);
 
-    // ครูที่ยังไม่เคยมีระเบียน PIN — บันทึกค่าตั้งต้นไว้ให้เป็นหลักฐาน
-    if (!stored) await writeSecret('teacher_secrets', id, { pin: DEFAULT_TEACHER_PIN });
+    // ครูที่ยังไม่เคยมีระเบียน PIN — บันทึกค่าตั้งต้นไว้ให้เป็นหลักฐาน (ถ้า Firestore ยังรับ)
+    if (!stored && db) {
+      try {
+        await writeSecret('teacher_secrets', id, { pin: DEFAULT_TEACHER_PIN });
+      } catch (wErr) {
+        console.warn('writeSecret fallback warn:', wErr.message);
+      }
+    }
 
     const token = await mintToken('tch_' + id, { role: 'teacher', tid: id });
     res.json({
@@ -3968,9 +4032,9 @@ app.post('/api/auth/teacher', async (req, res) => {
       usingDefaultPin: pin === DEFAULT_TEACHER_PIN,
       teacher: {
         id,
-        name: tDoc.data().name || '',
-        department: tDoc.data().department || '',
-        email: tDoc.data().email || ''
+        name: tData.name || '',
+        department: tData.department || '',
+        email: tData.email || ''
       }
     });
   } catch (err) {
@@ -4347,6 +4411,11 @@ app.post('/api/auth/staff', async (req, res) => {
     res.json({ ok: true, token, role: 'sub', staff: { id: staff.id, name: staff.name, username: staff.username } });
   } catch (err) {
     console.error('auth/staff:', err);
+    if (err.message && (err.message.includes('RESOURCE_EXHAUSTED') || err.message.includes('Quota exceeded'))) {
+      return res.status(503).json({
+        error: 'โควตาฐานข้อมูล Firestore (Spark Free Plan) ครบกำหนดชั่วคราว — กรุณาเข้าสู่ระบบด้วยปุ่ม "เข้าสู่ระบบเจ้าหน้าที่ด้วย Google (1-Click)" หรือติดต่อผู้ดูแลเพื่ออัปเกรดเป็น Blaze Plan'
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -4457,21 +4526,40 @@ app.post('/api/auth/google', async (req, res) => {
     // Helper functions สำหรับค้นหาผู้ใช้ตามบทบาท
     // หา id ที่ผูกอีเมลนี้ไว้ ทั้งในเอกสารหลักและ *_secrets (ค้นด้วย where ไม่โหลดทั้ง collection)
     const findIdByEmail = async (mainCol, secretCol) => {
-      const [a, b] = await Promise.all([
-        db.collection(mainCol).where('email', '==', verifiedEmail).limit(1).get(),
-        db.collection(secretCol).where('email', '==', verifiedEmail).limit(1).get()
-      ]);
-      if (!a.empty) return a.docs[0].id;
-      if (!b.empty) return b.docs[0].id;
+      try {
+        if (!db) return null;
+        const [a, b] = await Promise.all([
+          db.collection(mainCol).where('email', '==', verifiedEmail).limit(1).get(),
+          db.collection(secretCol).where('email', '==', verifiedEmail).limit(1).get()
+        ]);
+        if (!a.empty) return a.docs[0].id;
+        if (!b.empty) return b.docs[0].id;
+      } catch (findErr) {
+        console.warn('findIdByEmail warning:', findErr.message);
+      }
       return null;
     };
 
     const checkTeacher = async () => {
-      const id = await findIdByEmail('teachers', 'teacher_secrets');
-      if (!id) return null;
-      const doc = await db.collection('teachers').doc(id).get();
-      if (!doc.exists) return null;
-      const d = doc.data();
+      let id = await findIdByEmail('teachers', 'teacher_secrets');
+      let d = null;
+      if (id && db) {
+        try {
+          const doc = await db.collection('teachers').doc(id).get();
+          if (doc.exists) d = doc.data();
+        } catch (e) {
+          console.warn('checkTeacher doc get warning:', e.message);
+        }
+      }
+      // Quota shield fallback: Check teachersFallbackList if Firestore is exhausted
+      if (!d && teachersFallbackList && teachersFallbackList.length > 0) {
+        const found = teachersFallbackList.find(t => String(t.email || '').trim().toLowerCase() === verifiedEmail);
+        if (found) {
+          id = found.id;
+          d = found;
+        }
+      }
+      if (!id || !d) return null;
       return { id, name: d.name || '', department: d.department || '', email: verifiedEmail };
     };
 
