@@ -4270,17 +4270,35 @@ app.post('/api/auth/admin-magic', async (req, res) => {
 });
 
 // ── Super Admin: เข้าสู่ระบบ ──────────────────────────────────────
+let cachedSuperAdminHash = process.env.ADMIN_PASSWORD_HASH || '';
+
 app.post('/api/auth/admin', async (req, res) => {
   try {
     const password = String(req.body?.password || '').trim();
     if (!password) return res.status(400).json({ error: 'กรุณากรอกรหัสผ่าน' });
     if (tooManyFails('adm:super')) return res.status(429).json({ error: LOCKED_MSG });
 
-    const sec = await db.collection('admin_secrets').doc('super').get();
-    let stored = sec.exists ? sec.data().passwordHash : '';
+    let stored = cachedSuperAdminHash;
     if (!stored) {
-      const cfg = await db.collection('system_config').doc('admin').get();
-      stored = cfg.exists ? cfg.data().passwordHash || '' : '';
+      try {
+        const sec = await db.collection('admin_secrets').doc('super').get();
+        stored = sec.exists ? sec.data().passwordHash : '';
+        if (!stored) {
+          const cfg = await db.collection('system_config').doc('admin').get();
+          stored = cfg.exists ? cfg.data().passwordHash || '' : '';
+        }
+        if (stored) {
+          cachedSuperAdminHash = stored;
+        }
+      } catch (fsErr) {
+        console.warn('Firestore read in auth/admin error:', fsErr.message);
+        if (fsErr.message && (fsErr.message.includes('RESOURCE_EXHAUSTED') || fsErr.message.includes('Quota exceeded'))) {
+          return res.status(503).json({
+            error: 'โควตาฐานข้อมูล Firestore (Spark Free Plan) ครบกำหนดชั่วคราว — ระบบจะรีเซ็ตอัตโนมัติรอบวันใหม่เวลา 14:00 น. หรือกรุณาเข้าสู่ระบบด้วยปุ่ม "เข้าสู่ระบบเจ้าหน้าที่ด้วย Google (1-Click)"'
+          });
+        }
+        throw fsErr;
+      }
     }
     if (!stored) {
       return res.status(503).json({ error: 'ยังไม่ได้ตั้งรหัสผ่าน Super Admin กรุณาติดต่อผู้ดูแลระบบ' });
@@ -4470,6 +4488,9 @@ app.post('/api/auth/google', async (req, res) => {
       const SUPER_ADMIN_EMAILS = String(process.env.SUPER_ADMIN_EMAILS || 'sirachut25432@gmail.com,sirachut@utp.ac.th')
         .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
       let isSuperAdmin = SUPER_ADMIN_EMAILS.includes(verifiedEmail);
+      if (isSuperAdmin) {
+        return { isSuperAdmin: true, matchedStaff: { id: 'super', name: 'Super Admin (ผู้ดูแลระบบสูงสุด)', email: verifiedEmail } };
+      }
       if (!isSuperAdmin) {
         try {
           const sys = await db.collection('system_config').doc('admin').get();
@@ -4478,16 +4499,23 @@ app.post('/api/auth/google', async (req, res) => {
           }
         } catch (e) {}
       }
+      if (isSuperAdmin) {
+        return { isSuperAdmin: true, matchedStaff: { id: 'super', name: 'Super Admin (ผู้ดูแลระบบสูงสุด)', email: verifiedEmail } };
+      }
 
-      const staffSnap = await db.collection('admin_users').where('email', '==', verifiedEmail).limit(1).get();
       let matchedStaff = null;
-      if (!staffSnap.empty) {
-        const doc = staffSnap.docs[0];
-        const d = doc.data();
-        if (d.isActive !== false) {
-          matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', username: d.username, role: d.role, email: verifiedEmail };
-          if (d.role === 'super' || doc.id === 'super') isSuperAdmin = true;
+      try {
+        const staffSnap = await db.collection('admin_users').where('email', '==', verifiedEmail).limit(1).get();
+        if (!staffSnap.empty) {
+          const doc = staffSnap.docs[0];
+          const d = doc.data();
+          if (d.isActive !== false) {
+            matchedStaff = { id: doc.id, name: d.name || d.username || 'เจ้าหน้าที่', username: d.username, role: d.role, email: verifiedEmail };
+            if (d.role === 'super' || doc.id === 'super') isSuperAdmin = true;
+          }
         }
+      } catch (staffErr) {
+        console.warn('staff search warn (quota or network):', staffErr.message);
       }
       return { isSuperAdmin, matchedStaff };
     };
