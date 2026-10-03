@@ -2909,13 +2909,14 @@ app.post('/api/admin/trigger-digest', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 // ROUTE: GET /api/admin/digest-status (ดูประวัติและสถานะรอบการส่งสรุปประจำวัน)
 // ════════════════════════════════════════════════════════════════
-app.get('/api/admin/digest-status', async (req, res) => {
+app.all('/api/admin/digest-status', async (req, res) => {
   try {
     const auth = await authorizeNotify(req);
     if (!auth) return res.status(401).json({ error: 'Unauthorized' });
     if (auth.via === 'token') {
       const c = auth.claims;
-      if (c.role !== 'admin' && c.role !== 'staff') {
+      const isAllowed = c.role === 'admin' || c.role === 'staff' || c.uid === 'adm_super' || String(c.uid || '').startsWith('adm_');
+      if (!isAllowed) {
         return res.status(403).json({ error: 'Forbidden' });
       }
     }
@@ -2967,7 +2968,8 @@ app.post('/api/admin/digest-config', async (req, res) => {
     if (!auth) return res.status(401).json({ error: 'Unauthorized' });
     if (auth.via === 'token') {
       const c = auth.claims;
-      if (c.role !== 'admin' && c.role !== 'staff') {
+      const isAllowed = c.role === 'admin' || c.role === 'staff' || c.uid === 'adm_super' || String(c.uid || '').startsWith('adm_');
+      if (!isAllowed) {
         return res.status(403).json({ error: 'ไม่มีสิทธิ์ดำเนินการ เฉพาะเจ้าหน้าที่หรือแอดมินเท่านั้น' });
       }
     }
