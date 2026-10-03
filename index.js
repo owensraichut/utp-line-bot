@@ -5514,17 +5514,35 @@ app.post('/api/auth/link-account', handleLinkAccount);
 // ════════════════════════════════════════════════════════════════
 app.post('/api/auth/staff-link-google', async (req, res) => {
   try {
-    const c = await callerClaims(req);
+    let c = await callerClaims(req);
+    const { idToken, directEmail, adminToken } = req.body || {};
+
+    if ((!c || (c.role !== 'admin' && c.role !== 'staff')) && adminToken) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(adminToken);
+        if (decoded && (decoded.role === 'admin' || decoded.role === 'staff')) {
+          c = decoded;
+        }
+      } catch (e) {}
+    }
+
     if (!c || (c.role !== 'admin' && c.role !== 'staff')) {
       return res.status(403).json({ error: 'ไม่มีสิทธิ์ดำเนินการ ต้องเข้าสู่ระบบเจ้าหน้าที่ก่อน' });
     }
 
-    const { idToken } = req.body || {};
-    const g = await verifiedGoogleEmail(idToken);
-    if (!g || !g.email) {
-      return res.status(401).json({ error: 'ยืนยันบัญชี Google ไม่สำเร็จ หรือยังไม่ได้ยืนยันอีเมล' });
+    let cleanEmail = '';
+    if (directEmail) {
+      cleanEmail = String(directEmail).trim().toLowerCase();
+      if (!cleanEmail || !cleanEmail.includes('@')) {
+        return res.status(400).json({ error: 'รูปแบบอีเมลไม่ถูกต้อง' });
+      }
+    } else {
+      const g = await verifiedGoogleEmail(idToken);
+      if (!g || !g.email) {
+        return res.status(401).json({ error: 'ยืนยันบัญชี Google ไม่สำเร็จ หรือยังไม่ได้ยืนยันอีเมล' });
+      }
+      cleanEmail = g.email;
     }
-    const cleanEmail = g.email;
 
     // ตรวจสอบว่ามี staff บัญชีอื่นใช้อีเมลนี้อยู่แล้วหรือไม่
     const existingStaff = await db.collection('admin_users').where('email', '==', cleanEmail).limit(1).get();
@@ -5535,12 +5553,12 @@ app.post('/api/auth/staff-link-google', async (req, res) => {
     if (c.role === 'admin' || c.aid === 'super') {
       await db.collection('system_config').doc('admin').set({ email: cleanEmail }, { merge: true });
       await db.collection('admin_secrets').doc('super').set({ email: cleanEmail }, { merge: true }).catch(() => {});
-      logServer('activity', 'Super Admin เชื่อมต่อบัญชี Google', 'Super Admin <' + cleanEmail + '>', { email: cleanEmail });
+      logServer('activity', 'Super Admin กำหนดอีเมลระบบ', 'Super Admin <' + cleanEmail + '>', { email: cleanEmail });
       return res.json({ ok: true, email: cleanEmail, role: 'super' });
     } else {
       await db.collection('admin_users').doc(c.aid).set({ email: cleanEmail, updatedAt: new Date().toISOString() }, { merge: true });
       await writeSecret('admin_secrets', c.aid, { email: cleanEmail });
-      logServer('activity', 'เจ้าหน้าที่เชื่อมต่อบัญชี Google', c.aid + ' <' + cleanEmail + '>', { staffId: c.aid });
+      logServer('activity', 'เจ้าหน้าที่กำหนดอีเมลระบบ', c.aid + ' <' + cleanEmail + '>', { staffId: c.aid });
       return res.json({ ok: true, email: cleanEmail, role: 'sub' });
     }
   } catch (err) {
@@ -6399,9 +6417,10 @@ async function handleTeacherDefectiveRoster(req, res) {
       if (teacherId || teacherName) {
         const cleanT = (teacherName || '').replace(/^(นาย|นางสาว|นาง|ว่าที่ร้อยตรี|ว่าที่ ร\.ต\.|ดร\.|ครู)\s*/, '').trim();
         records = inMemoryDashboardCache.allRecords.filter(r => {
-          if (teacherId && r.teacherId === teacherId) return true;
+          if (teacherId && String(r.teacherId) === String(teacherId)) return true;
           if (cleanT && (r.teacherName || '').includes(cleanT)) return true;
           if (cleanT && Array.isArray(r.teacherNames) && r.teacherNames.some(tn => tn.includes(cleanT))) return true;
+          if (cleanT && r.rawTeacher && r.rawTeacher.includes(cleanT)) return true;
           return false;
         });
       } else {
