@@ -2128,10 +2128,20 @@ async function staffEmailList() {
 
 // ── สรุปรายงานประจำวันสำหรับแอดมินและฝ่ายวัดผล (08:00 น. และ 16:00 น.) ──
 //    ส่งทั้งทาง LINE Flex Message และ Email ถึงเจ้าหน้าที่ทุกคนที่มีการผูกบัญชี
-async function sendStaffDailyDigest({ timeSlot = 'auto', force = false } = {}) {
+async function sendStaffDailyDigest({ timeSlot = 'auto', force = false, config: passedConfig = null } = {}) {
   if (!db) return { sent: false, reason: 'no db' };
 
   try {
+    let cfg = passedConfig;
+    if (!cfg) {
+      try {
+        const snapCfg = await db.collection('system_config').doc('admin_digest_schedule').get();
+        cfg = snapCfg.exists ? snapCfg.data() : {};
+      } catch (e) {
+        cfg = {};
+      }
+    }
+
     const nowBangkok = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
     const hour = nowBangkok.getHours();
     const year = nowBangkok.getFullYear();
@@ -2144,12 +2154,18 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false } = {}) {
       slotType = hour < 12 ? 'morning' : 'afternoon';
     }
 
+    const morningTime = (cfg.morningTime && typeof cfg.morningTime === 'string') ? cfg.morningTime.trim() : '08:00';
+    const afternoonTime = (cfg.afternoonTime && typeof cfg.afternoonTime === 'string') ? cfg.afternoonTime.trim() : '16:00';
+    const morningDesc = (cfg.morningDesc && typeof cfg.morningDesc === 'string') ? cfg.morningDesc.trim() : 'สรุปงานรอลง SGS และคำร้องค้างตรวจรอบเช้า';
+    const afternoonDesc = (cfg.afternoonDesc && typeof cfg.afternoonDesc === 'string') ? cfg.afternoonDesc.trim() : 'สรุปผลงานที่ลง SGS แล้วประจำวัน และยอดคั่งค้าง';
+
     const slotTitle = slotType === 'morning'
-      ? '🌅 สรุปงานประจำวัน (รอบเช้า 08:00 น.)'
+      ? `🌅 สรุปงานประจำวัน (รอบเช้า ${morningTime} น.)`
       : slotType === 'afternoon'
-      ? '🌇 สรุปผลงานประจำวัน (รอบเย็น 16:00 น.)'
+      ? `🌇 สรุปผลงานประจำวัน (รอบเย็น ${afternoonTime} น.)`
       : '📢 สรุปสถานะคำร้อง UTP SGS (แจ้งเตือนพิเศษ)';
 
+    const slotNote = slotType === 'morning' ? morningDesc : slotType === 'afternoon' ? afternoonDesc : '';
     const slotBadgeColor = slotType === 'morning' ? '#1E40AF' : slotType === 'afternoon' ? '#D97706' : '#2563EB';
 
     const thaiDate = nowBangkok.toLocaleDateString('th-TH', {
@@ -2201,7 +2217,7 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false } = {}) {
         type: 'box', layout: 'vertical', backgroundColor: slotBadgeColor, paddingAll: '16px',
         contents: [
           { type: 'text', text: slotTitle, color: '#FFFFFF', weight: 'bold', size: 'md' },
-          { type: 'text', text: `${thaiDate} • โรงเรียนอุเทนพัฒนา`, color: '#FFFFFFAA', size: 'xs', margin: 'xs' },
+          { type: 'text', text: slotNote ? `${slotNote} • ${thaiDate}` : `${thaiDate} • โรงเรียนอุเทนพัฒนา`, color: '#FFFFFFAA', size: 'xs', margin: 'xs', wrap: true },
         ]
       },
       body: {
@@ -2295,7 +2311,7 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false } = {}) {
       <div style="font-family: 'Sarabun', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 650px; margin: 0 auto; background: #0f172a; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #334155;">
         <div style="background: linear-gradient(135deg, ${slotBadgeColor}, #1d4ed8); padding: 24px; text-align: center;">
           <h2 style="margin: 0; color: #ffffff; font-size: 20px; font-weight: 700;">${slotTitle}</h2>
-          <p style="margin: 6px 0 0; color: #dbeafe; font-size: 13px;">${thaiDate} • ระบบบริหารจัดการผลการเรียน โรงเรียนอุเทนพัฒนา</p>
+          <p style="margin: 6px 0 0; color: #dbeafe; font-size: 13px;">${slotNote ? `${slotNote} • ` : ''}${thaiDate} • ระบบบริหารจัดการผลการเรียน โรงเรียนอุเทนพัฒนา</p>
         </div>
         <div style="padding: 24px;">
           <p style="font-size: 15px; color: #e2e8f0; margin-top: 0;">เรียน <strong>ผู้ดูแลระบบและเจ้าหน้าที่ฝ่ายวัดผล</strong>,</p>
@@ -2372,32 +2388,51 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false } = {}) {
           </div>
         </div>
         <div style="background: #090d16; padding: 14px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #1e293b;">
-          ระบบสรุปแจ้งเตือนอัตโนมัติวันละ 2 รอบ (08:00 น. และ 16:00 น.) เฉพาะเจ้าหน้าที่และแอดมิน • โรงเรียนอุเทนพัฒนา
+          ระบบสรุปแจ้งเตือนอัตโนมัติวันละ 2 รอบ (${morningTime} น. และ ${afternoonTime} น.) เฉพาะเจ้าหน้าที่และแอดมิน • โรงเรียนอุเทนพัฒนา
         </div>
       </div>
     `;
 
-    // ── ส่ง LINE Message ──
-    const lineTargets = await staffLineIds();
+    // ── ส่ง LINE Message (ตรวจสอบการตั้งค่า channelLine) ──
+    let lineTargets = [];
     let sentLineCount = 0;
-    for (const targetId of lineTargets) {
-      try {
-        await sendLineFlexMessage(targetId, `${slotTitle} - รอบันทึก ${stats.pendingSgs} รายการ`, flexContents);
-        sentLineCount++;
-      } catch (err) {
-        console.warn('Line digest send failed to', targetId, err.message);
+    if (cfg.channelLine !== false) {
+      lineTargets = await staffLineIds();
+      for (const targetId of lineTargets) {
+        try {
+          await sendLineFlexMessage(targetId, `${slotTitle} - รอบันทึก ${stats.pendingSgs} รายการ`, flexContents);
+          sentLineCount++;
+        } catch (err) {
+          console.warn('Line digest send failed to', targetId, err.message);
+        }
       }
     }
 
-    // ── ส่ง Email Message ──
-    const emailTargets = await staffEmailList();
+    // ── ส่ง Email Message (ตรวจสอบการตั้งค่า channelEmail & customEmails) ──
+    let emailTargets = [];
     let sentEmailCount = 0;
-    for (const targetEmail of emailTargets) {
-      try {
-        await sendSystemEmail({ to: targetEmail, subject: emailSubject, htmlText: emailHtml });
-        sentEmailCount++;
-      } catch (err) {
-        console.warn('Email digest send failed to', targetEmail, err.message);
+    if (cfg.channelEmail !== false) {
+      const emailSet = new Set();
+      if (cfg.notifyStaffGroup !== false) {
+        const staffEmails = await staffEmailList();
+        staffEmails.forEach(e => emailSet.add(e));
+      }
+      if (cfg.customEmails && typeof cfg.customEmails === 'string') {
+        const extra = cfg.customEmails.split(/[,;\s]+/).map(s => s.trim().toLowerCase()).filter(s => s.includes('@'));
+        extra.forEach(e => emailSet.add(e));
+      }
+      if (emailSet.size === 0) {
+        emailSet.add('sirachut@utp.ac.th');
+      }
+      emailTargets = Array.from(emailSet);
+
+      for (const targetEmail of emailTargets) {
+        try {
+          await sendSystemEmail({ to: targetEmail, subject: emailSubject, htmlText: emailHtml });
+          sentEmailCount++;
+        } catch (err) {
+          console.warn('Email digest send failed to', targetEmail, err.message);
+        }
       }
     }
 
@@ -2481,14 +2516,20 @@ async function notifyStaffGradeChanged(reqData, oldGrade, newGrade, teacherName)
   }
 }
 
-// ── Background Scheduler สำหรับส่งสรุปแจ้งเตือนวันละ 2 รอบ ───────────
-//    รอบเช้า: 08:00 น. | รอบเย็น: 16:00 น. (เวลาประเทศไทย Asia/Bangkok)
+// ── Background Scheduler สำหรับส่งสรุปแจ้งเตือนวันละ 2 รอบ (ปรับแต่งได้โดย Admin) ───────────
 function startDigestScheduler() {
-  console.log('⏰ [Scheduler] Staff Daily Digest Scheduler started (08:00 & 16:00 Asia/Bangkok)');
+  console.log('⏰ [Scheduler] Staff Daily Digest Scheduler started (Dynamic Schedule Asia/Bangkok)');
 
   setInterval(async () => {
     try {
       if (!db) return;
+      const schedRef = db.collection('system_config').doc('admin_digest_schedule');
+      const snap = await schedRef.get();
+      const cfg = snap.exists ? snap.data() : {};
+
+      // หากผู้ดูแลระบบปิดการทำงานหลัก ให้ข้ามการประมวลผล
+      if (cfg.enabled === false) return;
+
       const nowBangkok = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
       const hour = nowBangkok.getHours();
       const minute = nowBangkok.getMinutes();
@@ -2500,22 +2541,37 @@ function startDigestScheduler() {
       let targetSlot = null;
       let slotType = null;
 
-      // รอบเช้า 08:00 น. (เช็คในหน้าต่างนาทีที่ 0 - 3)
-      if (hour === 8 && minute >= 0 && minute <= 3) {
-        targetSlot = `${dateStr}_08`;
-        slotType = 'morning';
+      // แปลงเวลาเช้า (ค่าเริ่มต้น 08:00)
+      const morningTime = (cfg.morningTime && typeof cfg.morningTime === 'string') ? cfg.morningTime.trim() : '08:00';
+      const [mH, mM] = morningTime.split(':').map(n => parseInt(n, 10));
+      const morningHour = isNaN(mH) ? 8 : mH;
+      const morningMinute = isNaN(mM) ? 0 : mM;
+
+      // แปลงเวลาเย็น (ค่าเริ่มต้น 16:00)
+      const afternoonTime = (cfg.afternoonTime && typeof cfg.afternoonTime === 'string') ? cfg.afternoonTime.trim() : '16:00';
+      const [aH, aM] = afternoonTime.split(':').map(n => parseInt(n, 10));
+      const afternoonHour = isNaN(aH) ? 16 : aH;
+      const afternoonMinute = isNaN(aM) ? 0 : aM;
+
+      // รอบเช้า (เช็คในหน้าต่างนาทีเป้าหมาย ถึง +3 นาที)
+      if (cfg.morningEnabled !== false) {
+        if (hour === morningHour && minute >= morningMinute && minute <= morningMinute + 3) {
+          targetSlot = `${dateStr}_${String(morningHour).padStart(2, '0')}${String(morningMinute).padStart(2, '0')}`;
+          slotType = 'morning';
+        }
       }
-      // รอบเย็น 16:00 น. (เช็คในหน้าต่างนาทีที่ 0 - 3)
-      else if (hour === 16 && minute >= 0 && minute <= 3) {
-        targetSlot = `${dateStr}_16`;
-        slotType = 'afternoon';
+
+      // รอบเย็น (เช็คในหน้าต่างนาทีเป้าหมาย ถึง +3 นาที)
+      if (!targetSlot && cfg.afternoonEnabled !== false) {
+        if (hour === afternoonHour && minute >= afternoonMinute && minute <= afternoonMinute + 3) {
+          targetSlot = `${dateStr}_${String(afternoonHour).padStart(2, '0')}${String(afternoonMinute).padStart(2, '0')}`;
+          slotType = 'afternoon';
+        }
       }
 
       if (!targetSlot) return;
 
-      const schedRef = db.collection('system_config').doc('admin_digest_schedule');
-      const snap = await schedRef.get();
-      if (snap.exists && snap.data().lastSentSlot === targetSlot) {
+      if (snap.exists && cfg.lastSentSlot === targetSlot) {
         return; // รอบนี้ส่งไปเรียบร้อยแล้ว
       }
 
@@ -2526,7 +2582,7 @@ function startDigestScheduler() {
       }, { merge: true });
 
       console.log(`⏰ [Scheduler] Executing automated staff digest for ${targetSlot} (${slotType})`);
-      const result = await sendStaffDailyDigest({ timeSlot: slotType });
+      const result = await sendStaffDailyDigest({ timeSlot: slotType, config: cfg });
       console.log(`✅ [Scheduler] Staff Daily Digest complete:`, result);
     } catch (err) {
       console.error('❌ [Scheduler] Error in staff digest scheduler:', err.message);
@@ -2869,11 +2925,26 @@ app.get('/api/admin/digest-status', async (req, res) => {
     const staffEmails = await staffEmailList();
     const staffLines = await staffLineIds();
 
+    const config = {
+      enabled: data.enabled !== false,
+      morningEnabled: data.morningEnabled !== false,
+      morningTime: data.morningTime || '08:00',
+      morningDesc: data.morningDesc || 'สรุปงานรอลง SGS และคำร้องค้างตรวจรอบเช้า',
+      afternoonEnabled: data.afternoonEnabled !== false,
+      afternoonTime: data.afternoonTime || '16:00',
+      afternoonDesc: data.afternoonDesc || 'สรุปผลงานที่ลง SGS แล้วประจำวัน และยอดคั่งค้าง',
+      channelLine: data.channelLine !== false,
+      channelEmail: data.channelEmail !== false,
+      notifyStaffGroup: data.notifyStaffGroup !== false,
+      customEmails: data.customEmails || 'sirachut@utp.ac.th'
+    };
+
     return res.json({
+      config,
       schedule: {
-        times: ['08:00', '16:00'],
+        times: [config.morningTime, config.afternoonTime],
         targetAudience: 'Admin & System Staff only',
-        active: true
+        active: config.enabled
       },
       lastDigest: data,
       recipients: {
@@ -2883,6 +2954,47 @@ app.get('/api/admin/digest-status', async (req, res) => {
     });
   } catch (err) {
     console.error('digest-status error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// ROUTE: POST /api/admin/digest-config (บันทึกการตั้งค่ารอบสรุปแจ้งเตือนประจำวัน)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/admin/digest-config', async (req, res) => {
+  try {
+    const auth = await authorizeNotify(req);
+    if (!auth) return res.status(401).json({ error: 'Unauthorized' });
+    if (auth.via === 'token') {
+      const c = auth.claims;
+      if (c.role !== 'admin' && c.role !== 'staff') {
+        return res.status(403).json({ error: 'ไม่มีสิทธิ์ดำเนินการ เฉพาะเจ้าหน้าที่หรือแอดมินเท่านั้น' });
+      }
+    }
+
+    const body = req.body || {};
+    const configUpdate = {
+      enabled: body.enabled !== false,
+      morningEnabled: body.morningEnabled !== false,
+      morningTime: (body.morningTime && typeof body.morningTime === 'string') ? body.morningTime.trim() : '08:00',
+      morningDesc: (body.morningDesc && typeof body.morningDesc === 'string') ? body.morningDesc.trim() : 'สรุปงานรอลง SGS และคำร้องค้างตรวจรอบเช้า',
+      afternoonEnabled: body.afternoonEnabled !== false,
+      afternoonTime: (body.afternoonTime && typeof body.afternoonTime === 'string') ? body.afternoonTime.trim() : '16:00',
+      afternoonDesc: (body.afternoonDesc && typeof body.afternoonDesc === 'string') ? body.afternoonDesc.trim() : 'สรุปผลงานที่ลง SGS แล้วประจำวัน และยอดคั่งค้าง',
+      channelLine: body.channelLine !== false,
+      channelEmail: body.channelEmail !== false,
+      notifyStaffGroup: body.notifyStaffGroup !== false,
+      customEmails: (body.customEmails && typeof body.customEmails === 'string') ? body.customEmails.trim() : 'sirachut@utp.ac.th',
+      updatedAt: new Date().toISOString(),
+      updatedBy: auth.claims?.email || auth.claims?.name || 'Super Admin'
+    };
+
+    await db.collection('system_config').doc('admin_digest_schedule').set(configUpdate, { merge: true });
+    logServer('activity', 'อัปเดตการตั้งค่าระบบแจ้งเตือนสรุปประจำวัน (Daily Staff Digest)', configUpdate.updatedBy, configUpdate);
+
+    return res.json({ ok: true, config: configUpdate });
+  } catch (err) {
+    console.error('digest-config error:', err);
     res.status(500).json({ error: err.message });
   }
 });
