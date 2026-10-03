@@ -2533,6 +2533,33 @@ async function callerClaims(req) {
   }
 }
 
+// ตรวจว่าผู้เรียกมีบทบาทที่อนุญาต — คืน claims หรือส่ง 401/403 แล้วคืน null
+async function requireRole(req, res, roles) {
+  const c = await callerClaims(req);
+  if (!c) { res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' }); return null; }
+  if (!roles.includes(c.role)) { res.status(403).json({ error: 'ไม่มีสิทธิ์เข้าถึงข้อมูลนี้' }); return null; }
+  return c;
+}
+
+// หลักฐานว่า LINE User ID มาจาก Magic Link ที่บอทลงนามจริง (ใช้ครั้งเดียว 30 นาที)
+async function issueLineProof(lineUserId) {
+  const proof = crypto.randomBytes(24).toString('hex');
+  await db.collection('line_link_proofs').doc(proof).set({
+    lineUserId, used: false, expiresAt: Date.now() + 30 * 60 * 1000, createdAt: new Date().toISOString()
+  });
+  return proof;
+}
+async function consumeLineProof(proof) {
+  if (!proof || typeof proof !== 'string') return null;
+  const ref = db.collection('line_link_proofs').doc(proof);
+  const snap = await ref.get();
+  if (!snap.exists) return null;
+  const d = snap.data();
+  if (d.used || Date.now() > d.expiresAt) return null;
+  await ref.update({ used: true, usedAt: new Date().toISOString() });
+  return d.lineUserId;
+}
+
 // รับได้ทั้ง secret (เรียกจากเซิร์ฟเวอร์ด้วยกัน) และ ID token (เรียกจากหน้าเว็บ)
 async function authorizeNotify(req) {
   if (SECRET_USABLE && req.body?.secret && safeEqual(req.body.secret, WEBHOOK_SECRET)) return { via: 'secret' };
@@ -3661,7 +3688,8 @@ function normalizeThaiTitle(raw) {
 function matchStudentFullName(dbFullName, inputPrefix, inputFirstName, inputLastName) {
   if (!dbFullName) return false;
   const cleanDb = String(dbFullName).replace(/\s+/g, ' ').trim();
-  const cleanFirst = String(inputFirstName || '').replace(/\s+/g, '').trim();
+  const rawFirst = String(inputFirstName || '').replace(/\s+/g, '').trim();
+  const cleanFirst = rawFirst.replace(/^(เด็กชาย|ด\.ช\.|เด็กหญิง|ด\.ญ\.|นางสาว|น\.ส\.|นาย)/, '');
   const cleanLast = String(inputLastName || '').replace(/\s+/g, '').trim();
   const normInputPrefix = normalizeThaiTitle(inputPrefix);
   
@@ -3801,13 +3829,19 @@ app.post('/api/auth/activate-student', async (req, res) => {
       return res.status(404).json({ error: 'ไม่พบรหัสนักเรียนนี้ในฐานข้อมูลโรงเรียน' });
     }
 
-    if (data.isActivated && (data.email || data.lineUserId)) {
+    // เปิดใช้งานแล้ว (มี PIN อยู่) ห้ามเปิดซ้ำ — เดิมเช็คแค่อีเมล/LINE
+    // ทำให้ใครรู้รหัส+ชื่อก็ตั้ง PIN ทับบัญชีที่ใช้ PIN อย่างเดียวได้
+    const existingPin = await studentSecret(id, 'pin').catch(() => null);
+    if (data.isActivated || existingPin) {
       return res.status(409).json({
-        error: 'รหัสนักเรียนนี้เปิดใช้งานและผูกบัญชีไปแล้ว กรุณาเข้าสู่ระบบ หรือติดต่อคุณครูเพื่อขอปลดล็อก'
+        error: 'รหัสนักเรียนนี้เปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วย PIN หรือให้คุณครูรีเซ็ตให้'
       });
     }
 
+    const akey = 'activate:' + id;
+    if (tooManyFails(akey)) return res.status(429).json({ error: LOCKED_MSG });
     const matched = matchStudentFullName(data.name, prefix, firstName, lastName);
+    if (!matched) noteFail(akey);
     if (!matched) {
       return res.status(400).json({
         error: 'ข้อมูลคำนำหน้า ชื่อ หรือนามสกุล ไม่ตรงกับฐานข้อมูลนักเรียน กรุณาตรวจสอบการสะกด'
@@ -3822,7 +3856,8 @@ app.post('/api/auth/activate-student', async (req, res) => {
       cleanEmail = (await consumeEmailProof(linkProof)) || '';
     }
 
-    const lineUserId = String(lineProfile?.lineUserId || '').trim();
+    // LINE ID ต้องมาจาก Magic Link ที่ลงนามแล้วเท่านั้น
+    const lineUserId = req.body && req.body.lineLinkProof ? (await consumeLineProof(req.body.lineLinkProof)) || '' : '';
 
     const updateData = {
       isActivated: true,
@@ -4059,7 +4094,12 @@ let cachedPublicTeachers = null;
 let lastPublicTeachersSync = 0;
 const PUBLIC_TEACHERS_TTL = 30 * 60 * 1000; // 30 mins
 
+// เบอร์โทรครูใช้เป็นชื่อผู้ใช้ตอนล็อกอิน ห้ามส่งออกไปกับรายชื่อสาธารณะ
+const stripPhones = (list) => (list || []).map(({ phone, ...rest }) => rest);
+
 app.get('/api/public-teachers', async (req, res) => {
+  const _json = res.json.bind(res);
+  res.json = (body) => _json(body && Array.isArray(body.teachers) ? { ...body, teachers: stripPhones(body.teachers) } : body);
   try {
     if (cachedPublicTeachers && (Date.now() - lastPublicTeachersSync < PUBLIC_TEACHERS_TTL)) {
       return res.json({ ok: true, teachers: cachedPublicTeachers });
@@ -4275,11 +4315,17 @@ app.post('/api/auth/teacher-change-pin', async (req, res) => {
 // ── ครู: บันทึก/ตั้งค่าห้องที่ปรึกษา (Advisory Class) ──────────────
 app.post('/api/auth/teacher-set-advisory', async (req, res) => {
   try {
-    const { teacherId, advisoryClass } = req.body || {};
-    const id = String(teacherId || '').trim();
-    if (!id) {
-      return res.status(400).json({ error: 'ไม่พบรหัสประจำตัวครู' });
-    }
+      const c = await requireRole(req, res, ['teacher', 'admin', 'staff']);
+      if (!c) return;
+      const { teacherId, advisoryClass } = req.body || {};
+      const id = String(teacherId || '').trim();
+      if (!id) {
+        return res.status(400).json({ error: 'ไม่พบรหัสประจำตัวครู' });
+      }
+      // ครูตั้งห้องที่ปรึกษาได้เฉพาะของตัวเอง (ห้องที่ปรึกษาเปิดสิทธิ์ดูข้อมูลนักเรียนทั้งห้อง)
+      if (c.role === 'teacher' && c.tid !== id) {
+        return res.status(403).json({ error: 'ตั้งค่าได้เฉพาะบัญชีของท่าน' });
+      }
     const cleanAdvisory = String(advisoryClass || '').trim();
     await db.collection('teachers').doc(id).set({
       advisoryClass: cleanAdvisory,
@@ -5926,10 +5972,11 @@ async function handleLineLoginCheck(lineUserId, displayName, pictureUrl, res) {
     });
   }
 
-  // 4. ยังไม่ได้ผูกบัญชี -> ตอบ needLink: true พร้อม profile
+  // 4. ยังไม่ได้ผูกบัญชี -> ตอบ needLink พร้อมหลักฐานว่า LINE ID นี้ยืนยันแล้ว
   return res.json({
     ok: true,
     needLink: true,
+    lineLinkProof: await issueLineProof(uid),
     lineProfile: {
       lineUserId: uid,
       displayName: displayName || '',
@@ -5950,8 +5997,9 @@ app.post('/api/auth/line-magic', async (req, res) => {
     if (isNaN(elapsed) || elapsed < 0 || elapsed > 30 * 24 * 60 * 60 * 1000) { // 30 วัน
       return res.status(401).json({ error: 'ลิงก์หมดอายุแล้ว' });
     }
-    const expected = sha256hex(`${WEBHOOK_SECRET}:${luid}:${lt}`);
-    if (!safeEqual(expected, lsig)) return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
+      if (!SECRET_USABLE) return res.status(503).json({ error: 'ลิงก์เข้าระบบอัตโนมัติปิดใช้ชั่วคราว กรุณาเข้าสู่ระบบด้วย PIN' });
+      const expected = sha256hex(`${WEBHOOK_SECRET}:${luid}:${lt}`);
+      if (!safeEqual(expected, lsig)) return res.status(401).json({ error: 'ลายเซ็นลิงก์ไม่ถูกต้อง' });
 
     return await handleLineLoginCheck(luid, decodeURIComponent(ldn || ''), decodeURIComponent(lpic || ''), res);
   } catch (err) {
@@ -5965,8 +6013,9 @@ app.post('/api/auth/line-magic', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 app.post('/api/auth/line', async (req, res) => {
   try {
-    const { lineUserId, displayName, pictureUrl } = req.body || {};
-    return await handleLineLoginCheck(lineUserId, displayName, pictureUrl, res);
+      // ปิดใช้: เดิมออก token ให้ใครก็ได้ที่ส่ง LINE User ID มา โดยไม่ตรวจกับ LINE
+      // การเข้าด้วย LINE ใช้ Magic Link ที่บอทลงนาม (/api/auth/line-magic) แทน
+      return res.status(410).json({ error: 'กรุณาเข้าสู่ระบบผ่านลิงก์จาก LINE OA ของโรงเรียน' });
   } catch (err) {
     console.error('auth/line error:', err);
     res.status(500).json({ error: err.message });
@@ -5979,8 +6028,9 @@ app.post('/api/auth/line', async (req, res) => {
 app.post('/api/auth/line-register', async (req, res) => {
   try {
     const { role, identifier, pin, name, studentClass, studentNo, email, lineProfile, isNewStudent } = req.body || {};
-    const lineUserId = String(lineProfile?.lineUserId || '').trim();
-    if (!lineUserId) return res.status(400).json({ error: 'ไม่พบ LINE User ID สำหรับผูกบัญชี' });
+      // LINE ID ต้องมาจาก Magic Link ที่ลงนามแล้ว ห้ามเชื่อค่าที่หน้าเว็บส่งมา
+      const lineUserId = await consumeLineProof(req.body && req.body.lineLinkProof);
+      if (!lineUserId) return res.status(401).json({ error: 'ลิงก์ผูกบัญชีหมดอายุ กรุณากดลิงก์จาก LINE OA ใหม่อีกครั้ง' });
     const inputPin = String(pin || '').trim();
 
     if (role === 'teacher') {
@@ -6165,9 +6215,11 @@ async function handleStudentDefects(req, res) {
     const studentId = String(req.params.studentId || req.body.studentId || req.query.studentId || '').trim();
     if (!studentId) return res.status(400).json({ error: 'กรุณาระบุรหัสนักเรียน (studentId)' });
 
-    // ตรวจสิทธิ์: ถ้าเป็นนักเรียน ต้องเป็น studentId ของตัวเอง
-    const c = await callerClaims(req);
-    if (c && c.role === 'student' && String(c.sid) !== studentId) {
+    // ตรวจสิทธิ์: ต้องล็อกอิน และนักเรียนดูได้เฉพาะของตัวเอง
+    // (เดิมถ้าไม่ส่ง token มาเลยกลับผ่าน)
+    const c = await requireRole(req, res, ['student', 'teacher', 'admin', 'staff']);
+    if (!c) return;
+    if (c.role === 'student' && String(c.sid) !== studentId) {
       return res.status(403).json({ error: 'ไม่มีสิทธิ์เข้าถึงข้อมูลของนักเรียนคนอื่น' });
     }
 
@@ -6234,13 +6286,19 @@ async function handleStudentDefects(req, res) {
 }
 app.get('/api/student-defects/:studentId', handleStudentDefects);
 app.get('/api/student-defects', handleStudentDefects);
+app.post('/api/student-defects/:studentId', handleStudentDefects);
 app.post('/api/student-defects', handleStudentDefects);
 
 // API: บัญชีนักเรียนที่ติด 0, ร, มส, มผ ในวิชาของครู
 async function handleTeacherDefectiveRoster(req, res) {
   try {
-    const teacherId = String(req.query.teacherId || req.body.teacherId || '').trim();
-    let teacherName = String(req.query.teacherName || req.body.teacherName || '').trim();
+    // เดิมไม่ตรวจสิทธิ์ — ใครก็ดึงรายชื่อนักเรียนที่ติดเกรดของครูคนไหนก็ได้
+    const c = await requireRole(req, res, ['teacher', 'admin', 'staff']);
+    if (!c) return;
+    const isTeacherCaller = c.role === 'teacher';
+    // ครูดูได้เฉพาะของตัวเอง ไม่ว่าจะส่ง teacherId อะไรมา
+    const teacherId = isTeacherCaller ? c.tid : String(req.query.teacherId || req.body.teacherId || '').trim();
+    let teacherName = isTeacherCaller ? '' : String(req.query.teacherName || req.body.teacherName || '').trim();
     const semester = String(req.query.semester || req.body.semester || '').trim();
     const gradeType = String(req.query.gradeType || req.body.gradeType || '').trim();
     const studentClass = String(req.query.studentClass || req.body.studentClass || '').trim();
@@ -6288,16 +6346,9 @@ async function handleTeacherDefectiveRoster(req, res) {
               }
             });
           }
-        } else {
-          // แอดมินหรือกรณีไม่ระบุครู
-          const snap = await withFsTimeout(db.collection('defective_records').limit(3000).get(), 2500);
-          snap.forEach(doc => {
-            if (!seen.has(doc.id)) {
-              seen.add(doc.id);
-              records.push({ id: doc.id, ...doc.data() });
-            }
-          });
         }
+        // ไม่ระบุครู (แอดมินดูภาพรวม): ใช้ข้อมูลจากแคชในหน่วยความจำด้านล่าง
+        // เดิมอ่าน Firestore 3,000 รายการต่อการเรียกหนึ่งครั้ง — ตัวการทำโควตาหมด
       } catch (fsErr) {
         console.warn('Firestore teacher roster read warning (using inMemoryDashboardCache fallback):', fsErr.message);
       }
@@ -6376,7 +6427,16 @@ app.post('/api/teacher-defective-roster', handleTeacherDefectiveRoster);
 // API: อัปเดตข้อมูล record ผลการเรียนบกพร่องโดยตรง
 app.post('/api/sync-defective-record', async (req, res) => {
   try {
+    // เดิมไม่ตรวจสิทธิ์ — ใครก็เปลี่ยนสถานะและเกรดในบันทึกผลการเรียนได้
+    const c = await requireRole(req, res, ['admin', 'staff', 'teacher']);
+    if (!c) return;
     const { studentId, subjectCode, term, year, status, requestId, newGrade } = req.body;
+    if (c.role === 'teacher') {
+      const rq = requestId ? await db.collection('requests').doc(String(requestId)).get() : null;
+      if (!rq || !rq.exists || rq.data().teacherId !== c.tid || rq.data().studentId !== studentId) {
+        return res.status(403).json({ error: 'แก้ไขได้เฉพาะคำร้องในวิชาของท่าน' });
+      }
+    }
     if (!studentId || !subjectCode) {
       return res.status(400).json({ error: 'ข้อมูลไม่ครบถ้วน' });
     }
@@ -6608,7 +6668,9 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
 });
 
 // Endpoint to fetch aggregated dashboard stats (0 Firestore Reads!)
-app.all('/api/admin/dashboard-stats', (req, res) => {
+app.all('/api/admin/dashboard-stats', async (req, res) => {
+  // เดิมไม่ตรวจสิทธิ์ — ใครก็ดึงรายชื่อ เบอร์โทร และผลการเรียนนักเรียนทั้งโรงเรียนได้
+  if (!(await requireRole(req, res, ['admin', 'staff']))) return;
   if (inMemoryDashboardCache) {
     return res.json({ ok: true, stats: inMemoryDashboardCache });
   }
