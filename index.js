@@ -63,6 +63,46 @@ try {
   console.error('❌ Firebase init error:', e.message);
 }
 
+// ── ตัวนับการอ่าน Firestore ฝั่งเซิร์ฟเวอร์ ─────────────────────────
+//    บันทึกว่าบรรทัดไหนในไฟล์นี้อ่านไปกี่เอกสาร เพื่อหาตัวที่ทำโควตาหมด
+//    ดูได้ที่ GET /api/admin/read-stats (เฉพาะแอดมิน)
+const READ_STATS = { since: new Date().toISOString(), total: 0, failed: 0, bySite: {} };
+function readSite() {
+  const frames = String(new Error().stack).split('\n').slice(2);
+  const f = frames.find(l => /index\.js:\d+/.test(l) && !/readSite|countedGet/.test(l));
+  if (!f) return '?';
+  const m = f.match(/at (?:async )?([\w.$<>]+)? ?\(?.*index\.js:(\d+)/);
+  return m ? `L${m[2]} ${m[1] || ''}`.trim() : '?';
+}
+function tallyRead(site, n) {
+  READ_STATS.total += n;
+  const s = READ_STATS.bySite[site] || (READ_STATS.bySite[site] = { docs: 0, calls: 0 });
+  s.docs += n;
+  s.calls += 1;
+}
+if (db) {
+  const Q = admin.firestore.Query.prototype;
+  const qGet = Q.get;
+  Q.get = async function countedGet(...args) {
+    const site = readSite();
+    try {
+      const snap = await qGet.apply(this, args);
+      tallyRead(site, Math.max(1, snap.size)); // คิวรีว่างก็คิด 1 ครั้ง
+      return snap;
+    } catch (e) { READ_STATS.failed++; throw e; }
+  };
+  const D = admin.firestore.DocumentReference.prototype;
+  const dGet = D.get;
+  D.get = async function countedGet(...args) {
+    const site = readSite();
+    try {
+      const snap = await dGet.apply(this, args);
+      tallyRead(site, 1);
+      return snap;
+    } catch (e) { READ_STATS.failed++; throw e; }
+  };
+}
+
 // ── Shield against hung Firestore gRPC connections / quota timeouts ──
 const withFsTimeout = (promise, ms = 2500) =>
   Promise.race([
@@ -6668,6 +6708,16 @@ app.post('/api/admin/batch-import-defects', async (req, res) => {
 });
 
 // Endpoint to fetch aggregated dashboard stats (0 Firestore Reads!)
+// สถิติการอ่าน Firestore ฝั่งเซิร์ฟเวอร์ตั้งแต่บูต — เรียงจากบรรทัดที่อ่านมากสุด
+app.get('/api/admin/read-stats', async (req, res) => {
+  if (!(await requireRole(req, res, ['admin']))) return;
+  const top = Object.entries(READ_STATS.bySite)
+    .sort((a, b) => b[1].docs - a[1].docs)
+    .slice(0, 40)
+    .map(([site, v]) => ({ site, ...v }));
+  res.json({ since: READ_STATS.since, total: READ_STATS.total, failed: READ_STATS.failed, top });
+});
+
 app.all('/api/admin/dashboard-stats', async (req, res) => {
   // เดิมไม่ตรวจสิทธิ์ — ใครก็ดึงรายชื่อ เบอร์โทร และผลการเรียนนักเรียนทั้งโรงเรียนได้
   if (!(await requireRole(req, res, ['admin', 'staff']))) return;
