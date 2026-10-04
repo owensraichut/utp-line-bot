@@ -2128,7 +2128,7 @@ async function staffEmailList() {
 
 // ── สรุปรายงานประจำวันสำหรับแอดมินและฝ่ายวัดผล (08:00 น. และ 16:00 น.) ──
 //    ส่งทั้งทาง LINE Flex Message และ Email ถึงเจ้าหน้าที่ทุกคนที่มีการผูกบัญชี
-async function sendStaffDailyDigest({ timeSlot = 'auto', force = false, config: passedConfig = null } = {}) {
+async function sendStaffDailyDigest({ timeSlot = 'auto', force = false, config: passedConfig = null, targetSlotKey = null } = {}) {
   if (!db) return { sent: false, reason: 'no db' };
 
   try {
@@ -2152,6 +2152,14 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false, config: 
     let slotType = timeSlot;
     if (slotType === 'auto') {
       slotType = hour < 12 ? 'morning' : 'afternoon';
+    }
+
+    // ── Secondary Guard: ป้องกันการส่งซ้ำหากไม่ได้สั่ง force และส่งรอบนี้ของวันไปแล้ว ──
+    if (!force && !targetSlotKey && (slotType === 'morning' || slotType === 'afternoon')) {
+      if (cfg && cfg[`lastSentDate_${slotType}`] === dateStr) {
+        console.log(`[sendStaffDailyDigest] Skipping ${slotType} digest for ${dateStr} - already sent today`);
+        return { ok: true, skipped: true, reason: 'already_sent_today' };
+      }
     }
 
     const morningTime = (cfg.morningTime && typeof cfg.morningTime === 'string') ? cfg.morningTime.trim() : '08:00';
@@ -2437,8 +2445,11 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false, config: 
     }
 
     // ── บันทึกประวัติการส่งลง Firestore ──
-    const slotKey = `${dateStr}_${hour.toString().padStart(2, '0')}`;
-    await db.collection('system_config').doc('admin_digest_schedule').set({
+    const slotKey = targetSlotKey || (timeSlot === 'manual'
+      ? `${dateStr}_manual_${hour.toString().padStart(2, '0')}${nowBangkok.getMinutes().toString().padStart(2, '0')}`
+      : `${dateStr}_${slotType}`);
+
+    const digestUpdate = {
       lastSentSlot: slotKey,
       lastSentAt: new Date().toISOString(),
       slotType,
@@ -2448,7 +2459,11 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false, config: 
       sentEmailCount,
       lineTargetsCount: lineTargets.length,
       emailTargetsCount: emailTargets.length
-    }, { merge: true });
+    };
+    if (slotType === 'morning' || slotType === 'afternoon') {
+      digestUpdate[`lastSentDate_${slotType}`] = dateStr;
+    }
+    await db.collection('system_config').doc('admin_digest_schedule').set(digestUpdate, { merge: true });
 
     logServer('activity', 'ส่งสรุปแจ้งเตือนเจ้าหน้าที่ประจำรอบ ' + slotTitle, 'LINE: ' + sentLineCount + ', Email: ' + sentEmailCount, stats);
 
@@ -2520,7 +2535,13 @@ async function notifyStaffGradeChanged(reqData, oldGrade, newGrade, teacherName)
 function startDigestScheduler() {
   console.log('⏰ [Scheduler] Staff Daily Digest Scheduler started (Dynamic Schedule Asia/Bangkok)');
 
+  let isDigestRunning = false;
+  const processedSlotsMemory = new Set();
+
   setInterval(async () => {
+    // ป้องกันการทำงานทับซ้อน (Concurrency Mutex)
+    if (isDigestRunning) return;
+
     try {
       if (!db) return;
       const schedRef = db.collection('system_config').doc('admin_digest_schedule');
@@ -2538,7 +2559,6 @@ function startDigestScheduler() {
       const day = String(nowBangkok.getDate()).padStart(2, '0');
       const dateStr = `${year}-${month}-${day}`;
 
-      let targetSlot = null;
       let slotType = null;
 
       // แปลงเวลาเช้า (ค่าเริ่มต้น 08:00)
@@ -2556,36 +2576,52 @@ function startDigestScheduler() {
       // รอบเช้า (เช็คในหน้าต่างนาทีเป้าหมาย ถึง +3 นาที)
       if (cfg.morningEnabled !== false) {
         if (hour === morningHour && minute >= morningMinute && minute <= morningMinute + 3) {
-          targetSlot = `${dateStr}_${String(morningHour).padStart(2, '0')}${String(morningMinute).padStart(2, '0')}`;
           slotType = 'morning';
         }
       }
 
       // รอบเย็น (เช็คในหน้าต่างนาทีเป้าหมาย ถึง +3 นาที)
-      if (!targetSlot && cfg.afternoonEnabled !== false) {
+      if (!slotType && cfg.afternoonEnabled !== false) {
         if (hour === afternoonHour && minute >= afternoonMinute && minute <= afternoonMinute + 3) {
-          targetSlot = `${dateStr}_${String(afternoonHour).padStart(2, '0')}${String(afternoonMinute).padStart(2, '0')}`;
           slotType = 'afternoon';
         }
       }
 
-      if (!targetSlot) return;
+      if (!slotType) return;
 
-      if (snap.exists && cfg.lastSentSlot === targetSlot) {
-        return; // รอบนี้ส่งไปเรียบร้อยแล้ว
+      const targetSlot = `${dateStr}_${slotType}`;
+
+      // ── Level 1: In-memory dedup (ป้องกันยิงซ้ำใน instance ปัจจุบัน 100%) ──
+      if (processedSlotsMemory.has(targetSlot)) {
+        return;
       }
 
-      // บันทึก slotKey ทันทีเพื่อกัน duplicate execution
-      await schedRef.set({
+      // ── Level 2 & 3: Firestore slot & date-level lock (ป้องกันข้าม instance/restarts) ──
+      if (snap.exists) {
+        if (cfg.lastSentSlot === targetSlot) return;
+        if (slotType === 'morning' && cfg.lastSentDate_morning === dateStr) return;
+        if (slotType === 'afternoon' && cfg.lastSentDate_afternoon === dateStr) return;
+      }
+
+      // ล็อคทันทีเพื่อป้องกันรอบ 30 วินาทีถัดไปเข้ามาแย่งทำ
+      isDigestRunning = true;
+      processedSlotsMemory.add(targetSlot);
+
+      // บันทึกลง Firestore ทันทีเป็น Atomic Pre-lock
+      const preLock = {
         lastSentSlot: targetSlot,
         triggeringAt: new Date().toISOString()
-      }, { merge: true });
+      };
+      preLock[`lastSentDate_${slotType}`] = dateStr;
+      await schedRef.set(preLock, { merge: true });
 
       console.log(`⏰ [Scheduler] Executing automated staff digest for ${targetSlot} (${slotType})`);
-      const result = await sendStaffDailyDigest({ timeSlot: slotType, config: cfg });
+      const result = await sendStaffDailyDigest({ timeSlot: slotType, config: cfg, targetSlotKey: targetSlot });
       console.log(`✅ [Scheduler] Staff Daily Digest complete:`, result);
     } catch (err) {
       console.error('❌ [Scheduler] Error in staff digest scheduler:', err.message);
+    } finally {
+      isDigestRunning = false;
     }
   }, 30 * 1000);
 }
