@@ -203,9 +203,35 @@ function generateLineMagicLink(lineUserId, displayName = '', pictureUrl = '') {
   return `${BASE_URL}/?page=line-auth&luid=${encodeURIComponent(lineUserId)}&lt=${timestamp}&lsig=${sig}&ldn=${dName}&lpic=${pUrl}`;
 }
 
+// ── โควตาข้อความ LINE OA (แพ็กเกจฟรี 300 ข้อความ/เดือน) ─────────────
+//    ข้อความที่ไม่จำเป็น (การ์ดต้อนรับหลังผูกบัญชี) จะงดส่งเมื่อเหลือน้อย
+//    เพื่อเก็บโควตาไว้ให้ OTP และสรุปงานเจ้าหน้าที่ ซึ่งขาดไม่ได้
+const LINE_RESERVE = 100;
+let lineQuotaCache = { remaining: Infinity, at: 0 };
+async function lineQuotaRemaining() {
+  if (Date.now() - lineQuotaCache.at < 10 * 60 * 1000) return lineQuotaCache.remaining;
+  try {
+    const h = { headers: { Authorization: 'Bearer ' + LINE_TOKEN }, timeout: 3000 };
+    const [q, used] = await Promise.all([
+      axios.get('https://api.line.me/v2/bot/message/quota', h),
+      axios.get('https://api.line.me/v2/bot/message/quota/consumption', h)
+    ]);
+    const remaining = q.data.type === 'limited' ? q.data.value - used.data.totalUsage : Infinity;
+    lineQuotaCache = { remaining, at: Date.now() };
+  } catch (e) {
+    lineQuotaCache.at = Date.now(); // เช็กไม่ได้ ใช้ค่าเดิมไปก่อน
+  }
+  return lineQuotaCache.remaining;
+}
+
 // ── Helper: ส่ง LINE Push Message ──────────────────────────────
-async function sendLineFlexMessage(lineUserId, altText, flexContents) {
+async function sendLineFlexMessage(lineUserId, altText, flexContents, { optional = false } = {}) {
   if (!LINE_TOKEN) { console.error('No LINE token'); return; }
+  if (optional && (await lineQuotaRemaining()) <= LINE_RESERVE) {
+    console.log('⏭️ ข้ามข้อความ LINE ที่ไม่จำเป็น (โควตาเดือนนี้ใกล้หมด):', altText);
+    return;
+  }
+  if (lineQuotaCache.remaining !== Infinity) lineQuotaCache.remaining--;
   try {
     const res = await axios.post(
       'https://api.line.me/v2/bot/message/push',
@@ -1467,22 +1493,17 @@ async function handleLineEvent(event) {
         return;
       }
       if (!db) return;
-      const reqSnap = await db.collection('requests').get();
-      const total = reqSnap.size;
-      let pendingTeacher = 0;
-      let assignedWork = 0;
-      let teacherApproved = 0;
-      let completed = 0;
-      let rejected = 0;
-
-      reqSnap.forEach(d => {
-        const st = d.data().status;
-        if (st === 'pending' || st === 'pending_teacher') pendingTeacher++;
-        else if (st === 'assigned_work') assignedWork++;
-        else if (st === 'teacher_approved') teacherApproved++;
-        else if (st === 'completed') completed++;
-        else if (st === 'rejected') rejected++;
-      });
+      // นับด้วย count() แทนการอ่านคำร้องทุกฉบับ
+      const reqCol = db.collection('requests');
+      const countOf = async (q) => (await q.count().get()).data().count;
+      const [total, pendingTeacher, assignedWork, teacherApproved, completed, rejected] = await Promise.all([
+        countOf(reqCol),
+        countOf(reqCol.where('status', 'in', ['pending', 'pending_teacher'])),
+        countOf(reqCol.where('status', '==', 'assigned_work')),
+        countOf(reqCol.where('status', '==', 'teacher_approved')),
+        countOf(reqCol.where('status', '==', 'completed')),
+        countOf(reqCol.where('status', '==', 'rejected'))
+      ]);
       const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
 
       const statFlex = {
@@ -2183,37 +2204,31 @@ async function sendStaffDailyDigest({ timeSlot = 'auto', force = false, config: 
       day: 'numeric'
     });
 
-    // ดึงคำร้องทั้งหมดจาก requests
-    const allReqSnap = await db.collection('requests').get();
-    const allRequests = allReqSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // เดิมอ่านคำร้องทุกฉบับรอบละครั้ง (หลายพันเอกสาร × วันละ 2 รอบ)
+    // ตอนนี้นับด้วย count() ซึ่งคิด 1 ครั้งต่อ 1,000 รายการ และอ่านเต็มเฉพาะที่ต้องแสดง
+    const reqCol = db.collection('requests');
+    const countOf = async (q) => (await q.count().get()).data().count;
+    const [pendingSgsSnap, todaySnap, pendingTeacherCount, assignedWorkCount, completedCount, totalAllCount] = await Promise.all([
+      reqCol.where('status', '==', 'teacher_approved').get(),
+      reqCol.where('completedAt', '>=', dateStr).where('completedAt', '<', dateStr + '').get(),
+      countOf(reqCol.where('status', 'in', ['pending_teacher', 'submitted'])),
+      countOf(reqCol.where('status', '==', 'assigned_work')),
+      countOf(reqCol.where('status', '==', 'completed')),
+      countOf(reqCol)
+    ]);
 
-    // แยกกลุ่มสถานะ
-    const pendingSgs = allRequests
-      .filter(r => r.status === 'teacher_approved')
+    const pendingSgs = pendingSgsSnap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
       .sort((a, b) => new Date(b.teacherApprovedAt || 0) - new Date(a.teacherApprovedAt || 0));
-
-    const pendingTeacher = allRequests
-      .filter(r => r.status === 'pending_teacher' || r.status === 'submitted');
-
-    const assignedWork = allRequests
-      .filter(r => r.status === 'assigned_work');
-
-    const completed = allRequests
-      .filter(r => r.status === 'completed');
-
-    const todayDatePrefix = dateStr; // YYYY-MM-DD
-    const completedToday = completed.filter(r => {
-      const dt = r.completedAt || r.resolvedAt || r.updatedAt || '';
-      return String(dt).startsWith(todayDatePrefix);
-    });
+    const completedToday = todaySnap.docs.filter(d => d.data().status === 'completed');
 
     const stats = {
       pendingSgs: pendingSgs.length,
-      pendingTeacher: pendingTeacher.length,
-      assignedWork: assignedWork.length,
+      pendingTeacher: pendingTeacherCount,
+      assignedWork: assignedWorkCount,
       completedToday: completedToday.length,
-      totalCompleted: completed.length,
-      totalAll: allRequests.length
+      totalCompleted: completedCount,
+      totalAll: totalAllCount
     };
 
     const preview = pendingSgs.slice(0, 5);
@@ -2531,6 +2546,39 @@ async function notifyStaffGradeChanged(reqData, oldGrade, newGrade, teacherName)
   }
 }
 
+// ── แคชตั้งค่ารอบส่งสรุป (กันอ่าน Firestore ทุก 30 วินาที) ──────────
+let digestCfgCache = { cfg: null, at: 0 };
+const DIGEST_CFG_TTL = 15 * 60 * 1000;
+async function digestConfigCached() {
+  if (digestCfgCache.cfg && Date.now() - digestCfgCache.at < DIGEST_CFG_TTL) return digestCfgCache.cfg;
+  try {
+    const snap = await db.collection('system_config').doc('admin_digest_schedule').get();
+    digestCfgCache = { cfg: snap.exists ? snap.data() : {}, at: Date.now() };
+  } catch (e) {
+    // อ่านไม่ได้ (เช่นโควตาเต็ม) — ใช้ค่าเดิมต่อ แล้วลองใหม่รอบหน้า
+    if (!digestCfgCache.cfg) return null;
+    digestCfgCache.at = Date.now();
+  }
+  return digestCfgCache.cfg;
+}
+function invalidateDigestConfig() { digestCfgCache = { cfg: null, at: 0 }; }
+
+// คืนรหัสรอบ เช่น 2026-10-04_morning ถ้าตอนนี้อยู่ในช่วงเวลาส่ง (นาทีเป้าหมาย ถึง +3 นาที) ไม่งั้นคืน null
+function digestSlotNow(cfg) {
+  if (!cfg || cfg.enabled === false) return null;
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const inWindow = (t, defH) => {
+    const [h, m] = (typeof t === 'string' ? t.trim() : '').split(':').map(n => parseInt(n, 10));
+    const hh = isNaN(h) ? defH : h;
+    const mm = isNaN(m) ? 0 : m;
+    return now.getHours() === hh && now.getMinutes() >= mm && now.getMinutes() <= mm + 3;
+  };
+  if (cfg.morningEnabled !== false && inWindow(cfg.morningTime, 8)) return `${dateStr}_morning`;
+  if (cfg.afternoonEnabled !== false && inWindow(cfg.afternoonTime, 16)) return `${dateStr}_afternoon`;
+  return null;
+}
+
 // ── Background Scheduler สำหรับส่งสรุปแจ้งเตือนวันละ 2 รอบ (ปรับแต่งได้โดย Admin) ───────────
 function startDigestScheduler() {
   console.log('⏰ [Scheduler] Staff Daily Digest Scheduler started (Dynamic Schedule Asia/Bangkok)');
@@ -2545,8 +2593,16 @@ function startDigestScheduler() {
     try {
       if (!db) return;
       const schedRef = db.collection('system_config').doc('admin_digest_schedule');
+      // เดิมอ่าน Firestore ทุก 30 วินาที = 2,880 ครั้ง/วัน แม้ไม่มีใครใช้ระบบ
+      // ตอนนี้ใช้ค่าที่แคชไว้ อ่านใหม่ทุก 15 นาที หรือเมื่อแอดมินแก้ตั้งค่า
+      const cachedCfg = await digestConfigCached();
+      if (cachedCfg === null) return;
+      const dueSlot = digestSlotNow(cachedCfg);
+      if (!dueSlot || processedSlotsMemory.has(dueSlot)) return;
+      // ถึงเวลาส่งแล้ว: อ่านค่าล่าสุดอีกครั้งเพื่อกันส่งซ้ำข้ามเครื่อง
       const snap = await schedRef.get();
       const cfg = snap.exists ? snap.data() : {};
+      digestCfgCache = { cfg, at: Date.now() };
 
       // หากผู้ดูแลระบบปิดการทำงานหลัก ให้ข้ามการประมวลผล
       if (cfg.enabled === false) return;
@@ -3028,6 +3084,7 @@ app.post('/api/admin/digest-config', async (req, res) => {
     };
 
     await db.collection('system_config').doc('admin_digest_schedule').set(configUpdate, { merge: true });
+    invalidateDigestConfig();
     logServer('activity', 'อัปเดตการตั้งค่าระบบแจ้งเตือนสรุปประจำวัน (Daily Staff Digest)', configUpdate.updatedBy, configUpdate);
 
     return res.json({ ok: true, config: configUpdate });
@@ -3476,21 +3533,28 @@ app.post('/api/request-pin-reset', async (req, res) => {
     let targetEmail = '';
 
     if (role === 'teacher') {
-      const [tSnap, sSnap] = await Promise.all([
-        db.collection('teachers').get(),
-        db.collection('teacher_secrets').get()
-      ]);
-      const secrets = {};
-      sSnap.forEach(d => { secrets[d.id] = d.data(); });
-
-      tSnap.forEach(doc => {
-        const d = doc.data();
-        const sec = secrets[doc.id] || {};
-        const mail = String(sec.email || d.email || '').toLowerCase();
-        if (doc.id === identifier || d.phone === identifier || (lookupEmail && mail === lookupEmail)) {
-          matchedUser = { id: doc.id, email: sec.email || d.email, ...d };
-        }
-      });
+      // ค้นเฉพาะเอกสารที่ตรง (เดิมอ่านครูและ teacher_secrets ทั้งตารางทุกครั้งที่มีคนกดขอ
+      // ซึ่งใครก็กดได้โดยไม่ต้องล็อกอิน = ช่องให้เผาโควตาได้ง่าย)
+      const id = String(identifier).trim();
+      const tCol = db.collection('teachers');
+      const sCol = db.collection('teacher_secrets');
+      const byId = (docId) => {
+        try { return tCol.doc(docId).get().then(d => (d.exists ? [d] : [])); }
+        catch (e) { return Promise.resolve([]); } // id มีอักขระที่ใช้เป็นชื่อเอกสารไม่ได้
+      };
+      const lookups = [byId(id), tCol.where('phone', '==', id).limit(1).get().then(s => s.docs)];
+      if (lookupEmail) {
+        lookups.push(tCol.where('email', '==', lookupEmail).limit(1).get().then(s => s.docs));
+        lookups.push(sCol.where('email', '==', lookupEmail).limit(1).get()
+          .then(s => (s.empty ? [] : byId(s.docs[0].id))));
+      }
+      const found = (await Promise.all(lookups)).flat()[0];
+      if (found) {
+        const d = found.data();
+        const secSnap = await sCol.doc(found.id).get();
+        const sec = secSnap.exists ? secSnap.data() : {};
+        matchedUser = { id: found.id, email: sec.email || d.email, ...d };
+      }
     } else {
       const id = String(identifier).trim();
       const [docSnap, secSnap] = await Promise.all([
@@ -4283,6 +4347,7 @@ app.post('/api/auth/student-register', async (req, res) => {
 let cachedPublicTeachers = null;
 let lastPublicTeachersSync = 0;
 const PUBLIC_TEACHERS_TTL = 30 * 60 * 1000; // 30 mins
+let publicTeachersRefreshing = false;
 
 // เบอร์โทรครูใช้เป็นชื่อผู้ใช้ตอนล็อกอิน ห้ามส่งออกไปกับรายชื่อสาธารณะ
 const stripPhones = (list) => (list || []).map(({ phone, ...rest }) => rest);
@@ -4302,8 +4367,11 @@ app.get('/api/public-teachers', async (req, res) => {
       }
       res.json({ ok: true, teachers: cachedPublicTeachers });
 
-      // Refresh from Firestore in background
-      if (db) {
+      // Refresh from Firestore in background — ทีละครั้งเดียว
+      // (เดิมผู้ใช้ที่เข้ามาพร้อมกันตอนแคชหมดอายุ ต่างคนต่างสั่งอ่านครูทั้งตาราง)
+      if (db && !publicTeachersRefreshing) {
+        publicTeachersRefreshing = true;
+        lastPublicTeachersSync = Date.now(); // ถ้าอ่านไม่สำเร็จ รอรอบ TTL ถัดไปค่อยลองใหม่
         db.collection('teachers').get().then(snap => {
           const list = snap.docs.map(d => {
             const data = d.data();
@@ -4321,7 +4389,8 @@ app.get('/api/public-teachers', async (req, res) => {
             cachedPublicTeachers = list;
             lastPublicTeachersSync = Date.now();
           }
-        }).catch(err => console.warn('Background teachers sync:', err.message));
+        }).catch(err => console.warn('Background teachers sync:', err.message))
+          .finally(() => { publicTeachersRefreshing = false; });
       }
       return;
     }
@@ -6278,7 +6347,7 @@ app.post('/api/auth/line-register', async (req, res) => {
           name: teacher.name || teacherId,
           extraInfo: `กลุ่มสาระฯ: ${teacher.department || '-'}`
         });
-        await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex);
+        await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex, { optional: true });
       } catch (lineErr) {
         console.warn('Failed to send teacher welcome flex:', lineErr.message);
       }
@@ -6334,7 +6403,7 @@ app.post('/api/auth/line-register', async (req, res) => {
             name: cleanName,
             extraInfo: `ชั้น ${studentData.studentClass || '-'} เลขที่ ${studentData.studentNo || '-'}`
           });
-          await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex);
+          await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex, { optional: true });
         } catch (lineErr) {
           console.warn('Failed to send student welcome flex:', lineErr.message);
         }
@@ -6392,7 +6461,7 @@ app.post('/api/auth/line-register', async (req, res) => {
             name: student.name || id,
             extraInfo: `ชั้น ${student.studentClass || '-'} เลขที่ ${student.studentNo || '-'}`
           });
-          await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex);
+          await sendLineFlexMessage(lineUserId, '🎉 ผูกบัญชี LINE กับระบบ SGS สำเร็จ', welcomeFlex, { optional: true });
         } catch (lineErr) {
           console.warn('Failed to send student welcome flex:', lineErr.message);
         }
